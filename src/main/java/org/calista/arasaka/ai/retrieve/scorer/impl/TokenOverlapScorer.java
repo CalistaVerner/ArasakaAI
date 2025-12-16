@@ -1,6 +1,7 @@
-package org.calista.arasaka.ai.retrieve;
+package org.calista.arasaka.ai.retrieve.scorer.impl;
 
 import org.calista.arasaka.ai.knowledge.Statement;
+import org.calista.arasaka.ai.retrieve.scorer.Scorer;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
 
 import java.util.HashSet;
@@ -26,7 +27,7 @@ public final class TokenOverlapScorer implements Scorer {
         for (String tok : t) if (qset.contains(tok)) hit++;
 
         // “взрослая” нормализация + учитываем weight утверждения
-        double overlap = (double) hit / Math.sqrt((double) (q.size() * t.size()));
+        double overlap = (double) hit / Math.sqrt((q.size() * t.size()));
         return overlap * st.weight;
     }
 }

@@ -1,4 +1,6 @@
-package org.calista.arasaka.ai.retrieve;
+package org.calista.arasaka.ai.retrieve.exploration;
+
+import org.calista.arasaka.ai.retrieve.Scored;
 
 import java.util.List;
 

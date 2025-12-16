@@ -1,7 +1,7 @@
 package org.calista.arasaka.ai.think.candidate.impl;
 
 import org.calista.arasaka.ai.knowledge.Statement;
-import org.calista.arasaka.ai.retrieve.TokenOverlapScorer;
+import org.calista.arasaka.ai.retrieve.scorer.impl.TokenOverlapScorer;
 import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
 

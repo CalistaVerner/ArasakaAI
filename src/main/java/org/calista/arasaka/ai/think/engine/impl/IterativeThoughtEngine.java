@@ -3,7 +3,7 @@ package org.calista.arasaka.ai.think.engine.impl;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.calista.arasaka.ai.knowledge.Statement;
-import org.calista.arasaka.ai.retrieve.Retriever;
+import org.calista.arasaka.ai.retrieve.retriver.Retriever;
 import org.calista.arasaka.ai.think.ResponseStrategy;
 import org.calista.arasaka.ai.think.TextGenerator;
 import org.calista.arasaka.ai.think.ThoughtResult;
@@ -166,7 +166,11 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 if (key != null) mergedByKey.putIfAbsent(key, s);
             }
 
-            List<Statement> context = new ArrayList<>(mergedByKey.values());
+            // Deterministic order: never rely on ConcurrentHashMap.values() encounter order.
+            List<Statement> context = mergedByKey.entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .map(Map.Entry::getValue)
+                    .toList();
             state.lastContext = context;
 
             // 3) Draft generation (N-best)
@@ -361,8 +365,10 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         if (sections == null || sections.isBlank()) sections = "summary,evidence,actions";
         if (style == null || style.isBlank()) style = "md";
 
-        sb.append("schema=").append(sections);
-        sb.append(";style=").append(style);
+        // 'format' is parsed by TextGenerator.Hint (keep key name stable).
+        // 'sections' is forward-compatible for ML generators.
+        sb.append("format=").append(style);
+        sb.append(";sections=").append(sections);
         sb.append(";intent=").append(state.intent == null ? Intent.UNKNOWN.name() : state.intent.name());
         sb.append(";iter=").append(state.iteration);
 

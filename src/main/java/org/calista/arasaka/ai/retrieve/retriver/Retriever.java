@@ -1,4 +1,4 @@
-package org.calista.arasaka.ai.retrieve;
+package org.calista.arasaka.ai.retrieve.retriver;
 
 import org.calista.arasaka.ai.knowledge.Statement;
 
