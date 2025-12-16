@@ -23,6 +23,10 @@ import java.util.regex.Pattern;
  * Supports sectioning contracts:
  *  - Legacy: 1) 2) 3)
  *  - Markdown: ## / ### headers (>= 3 headers)
+ *
+ * IMPORTANT: No-context mode:
+ *  - When context is empty, do NOT punish groundedness/novelty harshly.
+ *  - Instead punish echoing the question and repetition. This fixes the "Кто ты?" -> "Кто ты?" loop.
  */
 public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
 
@@ -33,7 +37,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
     private final double minQueryCoverage;      // candidate should overlap with user query
     private final double maxNovelty;            // too many tokens not in context => likely hallucination
     private final double maxRepetition;         // excessive repetition => low quality / loop
-    private final int minChars;                 // too short => usually useless
+    private final int minChars;                 // too short => usually useless (context mode)
     private final int maxCharsSoft;             // soft penalty after this
     private final int maxCharsHard;             // invalid after this (prevents runaway verbosity)
 
@@ -107,15 +111,77 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
         if (a.isEmpty()) {
             return invalid(-1.0, "err=empty");
         }
-        if (a.length() < minChars) {
-            return invalid(-0.8, "err=too_short;len=" + a.length());
-        }
         if (a.length() > maxCharsHard) {
             return invalid(-0.6, "err=too_long_hard;len=" + a.length());
         }
 
         // ---- 1) Structure quality ----
         Structure s = structureOf(a);
+
+        // ---- No-context mode (chat/identity/smalltalk) ----
+        // Do not invalidate short answers here; short can be fine without evidence.
+        if (ctx.isEmpty()) {
+            double queryCoverage = queryCoverage(q, a);
+            Repetition rep = repetition(a);
+            double echoPenalty = echoPenalty(q, a);
+
+            // In no-context mode, schema isn't mandatory; keep soft penalty only.
+            double structureSoft = clamp01(s.structurePenalty) * 0.25;
+
+            double verbosityPenalty = 0.0;
+            if (a.length() > maxCharsSoft) {
+                double over = (double) (a.length() - maxCharsSoft) / (double) Math.max(1, (maxCharsHard - maxCharsSoft));
+                verbosityPenalty = clamp01(over) * 0.35;
+            }
+
+            double stylePenalty = structureSoft + verbosityPenalty + rep.repetitionPenalty + echoPenalty;
+
+            // Treat “risk” as “uselessness/loop risk” here.
+            double contradictionRisk = clamp01(
+                    0.10
+                            + 0.35 * echoPenalty
+                            + 0.25 * rep.repetition
+                            + 0.10 * (s.hasAllSections ? 0.0 : 1.0)
+            );
+
+            boolean valid =
+                    // allow lower query coverage in no-context mode, but avoid pure echo
+                    queryCoverage >= (minQueryCoverage * 0.50)
+                            && echoPenalty <= 0.60
+                            && rep.repetition <= maxRepetition
+                            && a.length() <= maxCharsHard;
+
+            double score =
+                    (0.75 * queryCoverage)
+                            - (0.95 * contradictionRisk)
+                            - (0.90 * stylePenalty)
+                            + (0.10 * s.actionability);
+
+            String telemetry = "noctx"
+                    + ";qc=" + fmt2(queryCoverage)
+                    + ";echo=" + fmt2(echoPenalty)
+                    + ";rep=" + fmt2(rep.repetition)
+                    + ";sec=" + s.sectionCount
+                    + ";md=" + s.mdHeaders
+                    + ";v=" + (valid ? 1 : 0);
+
+            return new Evaluation(
+                    score,
+                    telemetry,
+                    queryCoverage,
+                    0.0,
+                    stylePenalty,
+                    0.0,                 // groundedness not applicable
+                    contradictionRisk,    // in noctx: loop/uselessness risk proxy
+                    valid,
+                    telemetry
+            );
+        }
+
+        // ---- Context mode: enforce minimal usefulness ----
+        if (a.length() < minChars) {
+            return invalid(-0.8, "err=too_short;len=" + a.length());
+        }
 
         // ---- 2) Groundedness to context (max + topK mean) ----
         GroundingAgg g = groundednessAgg(a, ctx);
@@ -164,17 +230,15 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
                         && n.novelty <= maxNovelty
                         && rep.repetition <= maxRepetition;
 
-        // ---- 9) Final score (ordering) ----
-        // Weighted to prefer: grounded + on-topic + structured; penalize risk + noise.
+        // ---- 9) Final score ----
         double score =
                 (1.15 * groundedness)
                         + (0.55 * queryCoverage)
                         - (1.05 * contradictionRisk)
                         - (1.00 * stylePenalty)
-                        - (0.35 * clamp01(n.novelty)) // extra nudge against unsupported mass
-                        + (0.10 * s.actionability);   // small bonus if it looks step-like
+                        - (0.35 * clamp01(n.novelty))
+                        + (0.10 * s.actionability);
 
-        // ---- 10) Legacy fields mapping (kept stable) ----
         double coverage = queryCoverage;
         double contextSupport = groundedness;
 
@@ -212,7 +276,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
         final boolean usesMarkdown;      // true if markdown headers drive the contract
         final double structurePenalty;   // 0..~1
         final double actionability;      // 0..1 (heuristic)
-        final int sectionCount;          // best-effort indicator: legacy count OR md header count
+        final int sectionCount;          // legacy count OR md header count
 
         private Structure(boolean hasAllSections,
                           boolean has1, boolean has2, boolean has3,
@@ -232,7 +296,6 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
     }
 
     private static Structure structureOf(String answer) {
-        // legacy markers must be line-start to avoid false positives in prose
         boolean has1 = LEGACY_1.matcher(answer).find();
         boolean has2 = LEGACY_2.matcher(answer).find();
         boolean has3 = LEGACY_3.matcher(answer).find();
@@ -250,30 +313,24 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
         boolean hasAll = legacyAll || mdAll;
         boolean usesMarkdown = (!legacyAll) && mdAll;
 
-        // penalties: missing contract, or malformed section ordering density
         double p = 0.0;
-
         if (!hasAll) {
-            // no recognizable schema at all
             p += 0.70;
         } else {
-            // recognized schema but weak signals
             if (legacyAll) {
-                if (legacyCount < 3) p += 0.20; // section markers not really present at line-start
+                if (legacyCount < 3) p += 0.20;
             } else {
-                // markdown schema
-                if (mdHeaders < 3) p += 0.20; // should not happen due to mdAll, but keep defensive
+                if (mdHeaders < 3) p += 0.20;
             }
         }
 
-        // actionability: presence of bullet/step patterns in body
         int bullets = 0;
         Matcher b = BULLETISH.matcher(answer);
         while (b.find()) bullets++;
 
-        double actionability = clamp01(bullets / 8.0); // saturates near 8 bullet-like lines
-
+        double actionability = clamp01(bullets / 8.0);
         int sectionCount = legacyAll ? legacyCount : mdHeaders;
+
         return new Structure(
                 hasAll,
                 has1, has2, has3,
@@ -311,8 +368,6 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
 
             double s = overlapScorer.score(answer, st);
             if (!Double.isFinite(s)) s = 0.0;
-
-            // scorer can exceed 1 because st.weight; normalize for stability.
             s = clamp01(s);
 
             if (s > best) {
@@ -336,15 +391,13 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
         }
         double mean = cnt == 0 ? 0.0 : sum / cnt;
 
-        // Primary signal: max support.
-        // Secondary can be used later: mean of topK (telemetry).
         return new GroundingAgg(best, bestIdx, best, K, mean);
     }
 
     // -------------------- query coverage --------------------
 
     private double queryCoverage(String userText, String candidateText) {
-        if (userText == null || userText.isBlank()) return 0.5; // no query => neutral
+        if (userText == null || userText.isBlank()) return 0.5;
         List<String> q = tokenizer.tokenize(userText);
         List<String> a = tokenizer.tokenize(candidateText);
         if (q.isEmpty() || a.isEmpty()) return 0.0;
@@ -353,7 +406,6 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
         int hit = 0;
         for (String tok : a) if (qset.contains(tok)) hit++;
 
-        // normalize similarly to overlap scorer, but bounded [0..1]
         double cov = (double) hit / Math.sqrt((double) (q.size() * a.size()));
         return clamp01(cov);
     }
@@ -361,7 +413,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
     // -------------------- novelty vs context --------------------
 
     private static final class Novelty {
-        final double novelty;     // 0..1 (share of tokens not in context token set)
+        final double novelty;
         final int totalTokens;
         final int novelTokens;
 
@@ -385,7 +437,6 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
         }
 
         if (ctxTok.isEmpty()) {
-            // No context: everything is "novel" (but risk should be handled elsewhere).
             return new Novelty(1.0, aTok.size(), aTok.size());
         }
 
@@ -394,7 +445,6 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
             if (!ctxTok.contains(t)) novel++;
         }
 
-        // We don't want novelty to punish simple stopwords too much, but tokenizer already normalizes.
         double ratio = (double) novel / (double) Math.max(1, aTok.size());
         return new Novelty(clamp01(ratio), aTok.size(), novel);
     }
@@ -402,8 +452,8 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
     // -------------------- repetition --------------------
 
     private static final class Repetition {
-        final double repetition;          // 0..1 (1 = very repetitive)
-        final double repetitionPenalty;   // 0..~1
+        final double repetition;         // 0..1
+        final double repetitionPenalty;  // 0..~1
         final int uniqueTokens;
         final int totalTokens;
 
@@ -415,33 +465,59 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
         }
     }
 
-    private Repetition repetition(String answer) {
-        // Token-based repetition
-        List<String> tok = tokenizer.tokenize(answer);
-        if (tok.isEmpty()) return new Repetition(1.0, 0.30, 0, 0);
+    private Repetition repetition(String text) {
+        List<String> toks = tokenizer.tokenize(text);
+        if (toks.isEmpty()) return new Repetition(0.0, 0.0, 0, 0);
 
-        Set<String> uniq = new HashSet<>(tok);
-        int total = tok.size();
-        int unique = uniq.size();
-
-        // repetition = 1 - (unique/total)
-        double rep = 1.0 - ((double) unique / (double) Math.max(1, total));
-        rep = clamp01(rep);
-
-        // Also detect degenerate loops at character level (low unique wordlike chunks)
-        int wordLike = countMatches(WORDLIKE, answer);
-        double loopSignal = 0.0;
-        if (wordLike > 0) {
-            double wlUniqueRatio = (double) unique / (double) Math.max(1, wordLike);
-            loopSignal = clamp01(1.0 - wlUniqueRatio);
+        Map<String, Integer> freq = new HashMap<>();
+        int total = 0;
+        for (String t : toks) {
+            if (t == null || t.isBlank()) continue;
+            if (t.length() < 2) continue;
+            freq.merge(t, 1, Integer::sum);
+            total++;
         }
+        int unique = freq.size();
+        if (total <= 0) return new Repetition(0.0, 0.0, unique, total);
 
-        double penalty = clamp01((rep * 0.65) + (loopSignal * 0.35)) * 0.55;
+        // repetition: how much token mass is repeats (beyond first occurrence)
+        int repeatMass = 0;
+        for (int c : freq.values()) if (c > 1) repeatMass += (c - 1);
 
+        double rep = clamp01((double) repeatMass / (double) Math.max(1, total));
+        double penalty = clamp01(rep / Math.max(1e-9, maxRepetition)) * 0.55;
         return new Repetition(rep, penalty, unique, total);
     }
 
-    // -------------------- telemetry + helpers --------------------
+    // -------------------- echo penalty (no-context) --------------------
+
+    /**
+     * Penalize answers that mostly repeat the question ("echo").
+     */
+    private double echoPenalty(String userText, String candidateText) {
+        if (userText == null || candidateText == null) return 0.0;
+        String q = userText.trim();
+        String a = candidateText.trim();
+        if (q.isEmpty() || a.isEmpty()) return 0.0;
+
+        Set<String> qt = new LinkedHashSet<>(tokenizer.tokenize(q));
+        Set<String> at = new LinkedHashSet<>(tokenizer.tokenize(a));
+        qt.removeIf(t -> t.length() < 2);
+        at.removeIf(t -> t.length() < 2);
+        if (qt.isEmpty() || at.isEmpty()) return 0.0;
+
+        int inter = 0;
+        for (String t : qt) if (at.contains(t)) inter++;
+        int union = qt.size() + at.size() - inter;
+        double j = union <= 0 ? 0.0 : (double) inter / (double) union;
+
+        if (j < 0.75) return 0.0;
+        double shortness = clamp01((double) (Math.max(0, (q.length() * 2) - a.length())) / (double) Math.max(1, q.length()));
+        double p = clamp01((j - 0.75) / 0.25) * (0.25 + 0.35 * shortness);
+        return clamp01(p);
+    }
+
+    // -------------------- invalid helper --------------------
 
     private static Evaluation invalid(double score, String note) {
         return new Evaluation(
@@ -456,6 +532,8 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
                 note
         );
     }
+
+    // -------------------- telemetry --------------------
 
     private static String telemetry(
             Structure s,
@@ -508,13 +586,6 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
             char ch = s.charAt(i);
             if (!Character.isLetterOrDigit(ch) && !Character.isWhitespace(ch)) c++;
         }
-        return c;
-    }
-
-    private static int countMatches(Pattern p, String s) {
-        int c = 0;
-        Matcher m = p.matcher(s);
-        while (m.find()) c++;
         return c;
     }
 

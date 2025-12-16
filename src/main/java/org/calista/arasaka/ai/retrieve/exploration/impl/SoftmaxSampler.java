@@ -4,21 +4,14 @@ import org.calista.arasaka.ai.retrieve.exploration.ExplorationConfig;
 import org.calista.arasaka.ai.retrieve.Scored;
 import org.calista.arasaka.ai.retrieve.exploration.ExplorationStrategy;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
-import java.util.Objects;
-import java.util.Set;
-import java.util.HashSet;
+import java.util.*;
 
 public final class SoftmaxSampler implements ExplorationStrategy {
     @Override
     public <T> List<T> select(List<Scored<T>> ranked, int k, ExplorationConfig cfg, long seed) {
         if (ranked == null || ranked.isEmpty() || k <= 0) return List.of();
 
-        // NOTE: "no randomness" requirement.
-        // We keep the softmax idea (temperature) but selection is deterministic and diversity-aware.
-        // Seed is used only for deterministic tie-breaking.
+        // Deterministic: no randomness, seed used only for stable tie-break.
 
         int hardTop = Math.min(cfg.topK * Math.max(1, cfg.candidateMultiplier), ranked.size());
         int need = Math.min(k, Math.min(cfg.topK, ranked.size()));
@@ -36,12 +29,15 @@ public final class SoftmaxSampler implements ExplorationStrategy {
             logw[i] = lw;
         }
 
+        // Cache token sets once per candidate to avoid repeated regex-split.
+        final HashMap<Integer, Set<String>> tokenCache = new HashMap<>(pool.size() * 2);
+
         ArrayList<Integer> remaining = new ArrayList<>(pool.size());
         for (int i = 0; i < pool.size(); i++) remaining.add(i);
 
         ArrayList<T> out = new ArrayList<>(need);
-        ArrayList<String> selectedTexts = new ArrayList<>(need);
-        Set<Integer> used = new HashSet<>(need * 2);
+        ArrayList<Integer> chosenIdx = new ArrayList<>(need);
+        HashSet<Integer> used = new HashSet<>(need * 2);
 
         for (int pick = 0; pick < need && !remaining.isEmpty(); pick++) {
             int bestIdx = -1;
@@ -49,15 +45,19 @@ public final class SoftmaxSampler implements ExplorationStrategy {
 
             for (int idx : remaining) {
                 if (used.contains(idx)) continue;
+
                 Scored<T> cand = pool.get(idx);
                 double base = logw[idx];
 
                 // Diversity penalty: subtract similarity to already chosen items.
-                double penalty = 0.0;
-                if (cfg.diversity > 0.0 && !selectedTexts.isEmpty()) {
-                    String ct = textOf(cand.item);
-                    for (String st : selectedTexts) penalty = Math.max(penalty, tokenJaccard(ct, st));
-                    base -= cfg.diversity * penalty;
+                if (cfg.diversity > 0.0 && !chosenIdx.isEmpty()) {
+                    Set<String> cTok = tokenCache.computeIfAbsent(idx, i -> tokenSetOf(textOf(cand.item)));
+                    double maxSim = 0.0;
+                    for (int j : chosenIdx) {
+                        Set<String> sTok = tokenCache.computeIfAbsent(j, ii -> tokenSetOf(textOf(pool.get(ii).item)));
+                        maxSim = Math.max(maxSim, jaccard(cTok, sTok));
+                    }
+                    base -= cfg.diversity * maxSim;
                 }
 
                 // Deterministic tie-break using stable hash mixed with seed.
@@ -71,14 +71,15 @@ public final class SoftmaxSampler implements ExplorationStrategy {
             }
 
             if (bestIdx < 0) break;
+
             used.add(bestIdx);
-            Scored<T> chosen = pool.get(bestIdx);
-            out.add(chosen.item);
-            selectedTexts.add(textOf(chosen.item));
+            out.add(pool.get(bestIdx).item);
+            chosenIdx.add(bestIdx);
 
             int finalBestIdx = bestIdx;
-            remaining.removeIf(i -> Objects.equals(i, finalBestIdx));
+            remaining.removeIf(i -> i == finalBestIdx);
         }
+
         return out;
     }
 
@@ -95,24 +96,32 @@ public final class SoftmaxSampler implements ExplorationStrategy {
         return String.valueOf(o);
     }
 
-    private static double tokenJaccard(String a, String b) {
-        if (a == null || b == null) return 0.0;
-        String aa = a.toLowerCase(Locale.ROOT);
-        String bb = b.toLowerCase(Locale.ROOT);
-        String[] ta = aa.split("[^\\p{L}\\p{Nd}_]+");
-        String[] tb = bb.split("[^\\p{L}\\p{Nd}_]+");
-        if (ta.length == 0 || tb.length == 0) return 0.0;
+    private static Set<String> tokenSetOf(String s) {
+        if (s == null || s.isBlank()) return Set.of();
+        String low = s.toLowerCase(Locale.ROOT);
+        String[] parts = low.split("[^\\p{L}\\p{Nd}_]+");
+        if (parts.length == 0) return Set.of();
 
-        HashSet<String> sa = new HashSet<>();
-        for (String t : ta) if (t != null && t.length() >= 3) sa.add(t);
-        if (sa.isEmpty()) return 0.0;
+        HashSet<String> out = new HashSet<>(Math.min(64, parts.length * 2));
+        for (String p : parts) {
+            if (p == null) continue;
+            String t = p.trim();
+            if (t.length() < 3) continue;
+            out.add(t);
+        }
+        return out.isEmpty() ? Set.of() : out;
+    }
+
+    private static double jaccard(Set<String> a, Set<String> b) {
+        if (a == null || b == null || a.isEmpty() || b.isEmpty()) return 0.0;
+        if (a == b) return 1.0;
+
+        Set<String> small = a.size() <= b.size() ? a : b;
+        Set<String> big = a.size() <= b.size() ? b : a;
+
         int inter = 0;
-        HashSet<String> sb = new HashSet<>();
-        for (String t : tb) if (t != null && t.length() >= 3) sb.add(t);
-        if (sb.isEmpty()) return 0.0;
-
-        for (String t : sa) if (sb.contains(t)) inter++;
-        int union = sa.size() + sb.size() - inter;
+        for (String t : small) if (big.contains(t)) inter++;
+        int union = a.size() + b.size() - inter;
         return union <= 0 ? 0.0 : (double) inter / (double) union;
     }
 

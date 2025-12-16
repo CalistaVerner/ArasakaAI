@@ -46,6 +46,15 @@ public final class AIConfig {
     public static final class Exploration {
         public double temperature = 0.8;
         public int topK = 40;
+        public int iterations = 3;
+        public int candidateMultiplier = 4;
+        public double diversity = 0.18;
+        public double minScore = 1e-9;
+        public double iterationDecay = 0.72;
+        public int refineTerms = 14;
+        public int candidateGateMinTokenLen = 3;
+        public int maxCandidatesPerIter = 120_000;
+        public double qualityFloor = 0.0;
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

@@ -30,9 +30,17 @@ public final class AIComposer {
         Scorer scorer = new TokenOverlapScorer(tokenizer);
 
         ExplorationConfig expl = new ExplorationConfig(
-                // оставляем, но НЕ связываем с draftsPerIteration
                 cfg.thinking.exploration.temperature,
-                cfg.thinking.exploration.topK
+                cfg.thinking.exploration.topK,
+                cfg.thinking.exploration.iterations,
+                cfg.thinking.exploration.candidateMultiplier,
+                cfg.thinking.exploration.diversity,
+                cfg.thinking.exploration.minScore,
+                cfg.thinking.exploration.iterationDecay,
+                cfg.thinking.exploration.refineTerms,
+                cfg.thinking.exploration.candidateGateMinTokenLen,
+                cfg.thinking.exploration.maxCandidatesPerIter,
+                cfg.thinking.exploration.qualityFloor
         );
 
         Retriever retriever = new KnowledgeRetriever(

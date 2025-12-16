@@ -40,8 +40,41 @@ public final class ExplorationConfig {
      */
     public final double iterationDecay;
 
+    /**
+     * How many terms to pull from top candidates to refine the next-iteration query.
+     */
+    public final int refineTerms;
+
+    /**
+     * Minimum token length for query tokens used in gating.
+     */
+    public final int candidateGateMinTokenLen;
+
+    /**
+     * Hard compute cap: max candidates processed per iteration (after gating).
+     */
+    public final int maxCandidatesPerIter;
+
+    /**
+     * Optional quality floor (confidence). If >0, retriever may return fewer results when uncertain.
+     */
+    public final double qualityFloor;
+
+    @Deprecated
     public ExplorationConfig(double temperature, int topK) {
-        this(temperature, topK, 2, 4, 0.15, 1e-9, 0.75);
+        this(
+                temperature,
+                topK,
+                2,
+                4,
+                0.15,
+                1e-9,
+                0.75,
+                12,
+                3,
+                200_000,
+                0.0
+        );
     }
 
     public ExplorationConfig(
@@ -51,7 +84,11 @@ public final class ExplorationConfig {
             int candidateMultiplier,
             double diversity,
             double minScore,
-            double iterationDecay
+            double iterationDecay,
+            int refineTerms,
+            int candidateGateMinTokenLen,
+            int maxCandidatesPerIter,
+            double qualityFloor
     ) {
         if (temperature <= 0.0) throw new IllegalArgumentException("temperature must be > 0");
         if (topK < 1) throw new IllegalArgumentException("topK must be >= 1");
@@ -61,6 +98,11 @@ public final class ExplorationConfig {
         if (!Double.isFinite(minScore) || minScore < 0.0) throw new IllegalArgumentException("minScore must be finite and >= 0");
         if (!(iterationDecay > 0.0 && iterationDecay <= 1.0)) throw new IllegalArgumentException("iterationDecay must be in (0..1]");
 
+        if (refineTerms < 0) throw new IllegalArgumentException("refineTerms must be >= 0");
+        if (candidateGateMinTokenLen < 1) throw new IllegalArgumentException("candidateGateMinTokenLen must be >= 1");
+        if (maxCandidatesPerIter < 1) throw new IllegalArgumentException("maxCandidatesPerIter must be >= 1");
+        if (!Double.isFinite(qualityFloor) || qualityFloor < 0.0) throw new IllegalArgumentException("qualityFloor must be finite and >= 0");
+
         this.temperature = temperature;
         this.topK = topK;
         this.iterations = iterations;
@@ -68,5 +110,10 @@ public final class ExplorationConfig {
         this.diversity = diversity;
         this.minScore = minScore;
         this.iterationDecay = iterationDecay;
+
+        this.refineTerms = refineTerms;
+        this.candidateGateMinTokenLen = candidateGateMinTokenLen;
+        this.maxCandidatesPerIter = maxCandidatesPerIter;
+        this.qualityFloor = qualityFloor;
     }
 }
