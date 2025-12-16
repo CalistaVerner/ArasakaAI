@@ -16,6 +16,7 @@ import java.util.regex.Pattern;
  * <p>Policy is expressed as keyword weights (configurable via constructor),
  * so you can tune it from config/tests and keep behavior stable.</p>
  */
+@Deprecated
 public final class SimpleIntentDetector implements IntentDetector {
 
     private static final Pattern WORD = Pattern.compile("[\\p{L}\\p{Nd}_]{2,}");

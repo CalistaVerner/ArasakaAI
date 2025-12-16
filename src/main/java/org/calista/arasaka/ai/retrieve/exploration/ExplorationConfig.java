@@ -1,81 +1,35 @@
 package org.calista.arasaka.ai.retrieve.exploration;
 
+/**
+ * Retrieval/exploration configuration for the multi-iteration "thinking" pipeline.
+ *
+ * The config is intentionally data-only (no hidden heuristics).
+ * All knobs are explicit and can be learned/tuned from logs.
+ */
 public final class ExplorationConfig {
-    /**
-     * Temperature used for softmax-style score smoothing.
-     * Lower -> greedier (closer to pure top-k), higher -> flatter.
-     */
     public final double temperature;
-
-    /**
-     * Upper bound for the candidate pool considered by the exploration strategy.
-     * Note: the strategy may internally expand this pool via {@link #candidateMultiplier}.
-     */
     public final int topK;
-
-    /**
-     * How many reasoning/retrieval iterations to run ("thinking cycles").
-     * Each iteration may refine the query and re-rank candidates.
-     */
     public final int iterations;
-
-    /**
-     * Candidate pool expansion factor. Example: topK=64, multiplier=4 => consider up to 256 candidates.
-     * Higher improves recall but increases compute.
-     */
     public final int candidateMultiplier;
-
-    /**
-     * Diversity strength in [0..1]. 0 -> no diversity penalty (pure score), 1 -> strong novelty preference.
-     */
     public final double diversity;
-
-    /**
-     * Hard floor for accepting a scored candidate (after scoring, before exploration).
-     */
     public final double minScore;
-
-    /**
-     * Iteration decay in (0..1]. 1 -> equal weight, lower -> earlier iterations dominate.
-     */
     public final double iterationDecay;
 
-    /**
-     * How many terms to pull from top candidates to refine the next-iteration query.
-     */
     public final int refineTerms;
-
-    /**
-     * Minimum token length for query tokens used in gating.
-     */
     public final int candidateGateMinTokenLen;
-
-    /**
-     * Hard compute cap: max candidates processed per iteration (after gating).
-     */
     public final int maxCandidatesPerIter;
 
-    /**
-     * Optional quality floor (confidence). If >0, retriever may return fewer results when uncertain.
-     */
     public final double qualityFloor;
 
-    @Deprecated
-    public ExplorationConfig(double temperature, int topK) {
-        this(
-                temperature,
-                topK,
-                2,
-                4,
-                0.15,
-                1e-9,
-                0.75,
-                12,
-                3,
-                200_000,
-                0.0
-        );
-    }
+    /** Early stop if confidence rises above this value (0 disables). */
+    public final double earlyStopConfidence;
+
+    /** Enable parallel scoring (deterministic). */
+    public final boolean parallel;
+
+    /** If parallel=true and this > 0, retriever uses this parallelism. */
+    public final int parallelism;
+
 
     public ExplorationConfig(
             double temperature,
@@ -88,7 +42,10 @@ public final class ExplorationConfig {
             int refineTerms,
             int candidateGateMinTokenLen,
             int maxCandidatesPerIter,
-            double qualityFloor
+            double qualityFloor,
+            double earlyStopConfidence,
+            boolean parallel,
+            int parallelism
     ) {
         if (temperature <= 0.0) throw new IllegalArgumentException("temperature must be > 0");
         if (topK < 1) throw new IllegalArgumentException("topK must be >= 1");
@@ -97,11 +54,12 @@ public final class ExplorationConfig {
         if (!(diversity >= 0.0 && diversity <= 1.0)) throw new IllegalArgumentException("diversity must be in [0..1]");
         if (!Double.isFinite(minScore) || minScore < 0.0) throw new IllegalArgumentException("minScore must be finite and >= 0");
         if (!(iterationDecay > 0.0 && iterationDecay <= 1.0)) throw new IllegalArgumentException("iterationDecay must be in (0..1]");
-
         if (refineTerms < 0) throw new IllegalArgumentException("refineTerms must be >= 0");
         if (candidateGateMinTokenLen < 1) throw new IllegalArgumentException("candidateGateMinTokenLen must be >= 1");
         if (maxCandidatesPerIter < 1) throw new IllegalArgumentException("maxCandidatesPerIter must be >= 1");
         if (!Double.isFinite(qualityFloor) || qualityFloor < 0.0) throw new IllegalArgumentException("qualityFloor must be finite and >= 0");
+        if (!Double.isFinite(earlyStopConfidence) || earlyStopConfidence < 0.0) throw new IllegalArgumentException("earlyStopConfidence must be finite and >= 0");
+        if (parallelism < 0) throw new IllegalArgumentException("parallelism must be >= 0");
 
         this.temperature = temperature;
         this.topK = topK;
@@ -115,5 +73,57 @@ public final class ExplorationConfig {
         this.candidateGateMinTokenLen = candidateGateMinTokenLen;
         this.maxCandidatesPerIter = maxCandidatesPerIter;
         this.qualityFloor = qualityFloor;
+
+        this.earlyStopConfidence = earlyStopConfidence;
+        this.parallel = parallel;
+        this.parallelism = parallelism;
+    }
+
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    public static final class Builder {
+        private double temperature = 0.9;
+        private int topK = 64;
+        private int iterations = 2;
+        private int candidateMultiplier = 4;
+        private double diversity = 0.15;
+        private double minScore = 0.0;
+        private double iterationDecay = 0.8;
+
+        private int refineTerms = 12;
+        private int candidateGateMinTokenLen = 3;
+        private int maxCandidatesPerIter = 50_000;
+        private double qualityFloor = 0.0;
+
+        private double earlyStopConfidence = 0.0;
+        private boolean parallel = false;
+        private int parallelism = 0;
+
+        public Builder temperature(double v) { this.temperature = v; return this; }
+        public Builder topK(int v) { this.topK = v; return this; }
+        public Builder iterations(int v) { this.iterations = v; return this; }
+        public Builder candidateMultiplier(int v) { this.candidateMultiplier = v; return this; }
+        public Builder diversity(double v) { this.diversity = v; return this; }
+        public Builder minScore(double v) { this.minScore = v; return this; }
+        public Builder iterationDecay(double v) { this.iterationDecay = v; return this; }
+
+        public Builder refineTerms(int v) { this.refineTerms = v; return this; }
+        public Builder candidateGateMinTokenLen(int v) { this.candidateGateMinTokenLen = v; return this; }
+        public Builder maxCandidatesPerIter(int v) { this.maxCandidatesPerIter = v; return this; }
+        public Builder qualityFloor(double v) { this.qualityFloor = v; return this; }
+
+        public Builder earlyStopConfidence(double v) { this.earlyStopConfidence = v; return this; }
+        public Builder parallel(boolean v) { this.parallel = v; return this; }
+        public Builder parallelism(int v) { this.parallelism = v; return this; }
+
+        public ExplorationConfig build() {
+            return new ExplorationConfig(
+                    temperature, topK, iterations, candidateMultiplier, diversity, minScore, iterationDecay,
+                    refineTerms, candidateGateMinTokenLen, maxCandidatesPerIter, qualityFloor,
+                    earlyStopConfidence, parallel, parallelism
+            );
+        }
     }
 }

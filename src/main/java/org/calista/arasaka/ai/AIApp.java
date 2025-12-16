@@ -5,7 +5,9 @@ import org.apache.logging.log4j.Logger;
 import org.calista.arasaka.ai.core.AIComposer;
 import org.calista.arasaka.ai.core.AIKernel;
 import org.calista.arasaka.ai.events.AIEvent;
-import org.calista.arasaka.ai.learn.SimpleLearner;
+import org.calista.arasaka.ai.learn.Learner;
+import org.calista.arasaka.ai.learn.impl.AdvancedLearner;
+import org.calista.arasaka.ai.learn.impl.SimpleLearner;
 import org.calista.arasaka.ai.tokenizer.impl.AdvancedTokenizer;
 
 import java.nio.file.Path;
@@ -21,7 +23,7 @@ public final class AIApp {
         var tokenizer = new AdvancedTokenizer();
         var engine = AIComposer.buildThinking(kernel, tokenizer);
 
-        SimpleLearner learner = new SimpleLearner(
+        Learner learner = new AdvancedLearner(
                 kernel.knowledge(),
                 tokenizer,
                 kernel.config().learning.newStatementWeight,

@@ -55,6 +55,9 @@ public final class AIConfig {
         public int candidateGateMinTokenLen = 3;
         public int maxCandidatesPerIter = 120_000;
         public double qualityFloor = 0.0;
+        public double earlyStopConfidence = 0.0;
+        public boolean parallel = false;
+        public int parallelism = 0;
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

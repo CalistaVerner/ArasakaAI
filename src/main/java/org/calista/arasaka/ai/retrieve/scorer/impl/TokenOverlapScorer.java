@@ -8,20 +8,22 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Enterprise-grade token overlap scorer:
- * - prepares DF/IDF stats once per corpus (prepare)
- * - caches per-statement token arrays (tokens)
- * - scores with IDF-weighted cosine-like overlap (stable + deterministic)
+ * TokenOverlapScorer:
+ *  - prepares DF/IDF stats once per corpus (prepare)
+ *  - caches per-statement token arrays (tokens)
+ *  - scores with an IDF-weighted BM25-lite overlap (stable + deterministic)
  */
 public final class TokenOverlapScorer implements Scorer {
     private final Tokenizer tokenizer;
 
-    // statementKey -> tokens
     private final Map<String, String[]> tokCache = new ConcurrentHashMap<>(64_000);
 
-    // token -> idf
     private volatile Map<String, Double> idf = Map.of();
+    private volatile double avgDocLen = 8.0;
     private volatile boolean prepared = false;
+
+    private static final double K1 = 1.2;
+    private static final double B = 0.75;
 
     public TokenOverlapScorer(Tokenizer tokenizer) {
         this.tokenizer = Objects.requireNonNull(tokenizer, "tokenizer");
@@ -37,6 +39,7 @@ public final class TokenOverlapScorer implements Scorer {
 
         HashMap<String, Integer> df = new HashMap<>(64_000);
         int docs = 0;
+        long totalLen = 0;
 
         for (Statement st : corpus) {
             if (st == null || st.text == null || st.text.isBlank()) continue;
@@ -44,6 +47,7 @@ public final class TokenOverlapScorer implements Scorer {
 
             String[] toks = tokenizeToArray(st.text);
             tokCache.put(keyOf(st), toks);
+            totalLen += toks.length;
 
             HashSet<String> uniq = new HashSet<>(toks.length * 2);
             for (String t : toks) if (t != null && t.length() >= 3) uniq.add(t);
@@ -58,6 +62,7 @@ public final class TokenOverlapScorer implements Scorer {
         }
 
         this.idf = Collections.unmodifiableMap(idfLocal);
+        this.avgDocLen = Math.max(1.0, (double) totalLen / Math.max(1.0, (double) docs));
         this.prepared = true;
     }
 
@@ -77,41 +82,39 @@ public final class TokenOverlapScorer implements Scorer {
         if (qt.length == 0 || dt == null || dt.length == 0) return 0.0;
 
         HashMap<String, Double> qw = new HashMap<>(qt.length * 2);
-        double qnorm2 = 0.0;
         for (String t : qt) {
             if (t == null || t.length() < 3) continue;
             double w = idf.getOrDefault(t, 1.0);
             qw.merge(t, w, Double::sum);
         }
-        for (double w : qw.values()) qnorm2 += w * w;
+        if (qw.isEmpty()) return 0.0;
 
-        double dot = 0.0;
-        double dnorm2 = 0.0;
-
-        HashMap<String, Double> dw = new HashMap<>(Math.min(256, dt.length * 2));
+        HashMap<String, Integer> tf = new HashMap<>(Math.min(256, dt.length * 2));
         for (String t : dt) {
             if (t == null || t.length() < 3) continue;
-            double w = idf.getOrDefault(t, 1.0);
-            dw.merge(t, w, Double::sum);
+            tf.merge(t, 1, Integer::sum);
+        }
+        if (tf.isEmpty()) return 0.0;
+
+        double dl = Math.max(1.0, (double) dt.length);
+        double norm = (1.0 - B) + B * (dl / avgDocLen);
+
+        double dot = 0.0;
+        for (var e : qw.entrySet()) {
+            Integer f = tf.get(e.getKey());
+            if (f == null || f <= 0) continue;
+
+            double idfW = idf.getOrDefault(e.getKey(), 1.0);
+            double tfPart = (f * (K1 + 1.0)) / (f + K1 * norm);
+            dot += e.getValue() * (idfW * tfPart);
         }
 
-        for (var e : dw.entrySet()) {
-            double w = e.getValue();
-            dnorm2 += w * w;
-            Double qv = qw.get(e.getKey());
-            if (qv != null) dot += qv * w;
-        }
-
-        if (dot <= 0.0) return 0.0;
-        double denom = Math.sqrt(qnorm2) * Math.sqrt(dnorm2);
-        if (denom <= 0.0) return 0.0;
-
-        double cosineLike = dot / denom;
+        if (!(dot > 0.0) || !Double.isFinite(dot)) return 0.0;
 
         double wst = Double.isFinite(st.weight) ? st.weight : 1.0;
         if (wst < 0.0) wst = 0.0;
 
-        return cosineLike * wst;
+        return dot * wst;
     }
 
     private String[] tokenizeToArray(String text) {
@@ -131,6 +134,7 @@ public final class TokenOverlapScorer implements Scorer {
 
     private static String keyOf(Statement st) {
         if (st.id != null && !st.id.isBlank()) return "id:" + st.id;
-        return "ihc:" + System.identityHashCode(st);
+        String t = st.text == null ? "" : st.text;
+        return "th:" + t.hashCode();
     }
 }

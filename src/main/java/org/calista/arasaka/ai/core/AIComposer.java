@@ -40,14 +40,18 @@ public final class AIComposer {
                 cfg.thinking.exploration.refineTerms,
                 cfg.thinking.exploration.candidateGateMinTokenLen,
                 cfg.thinking.exploration.maxCandidatesPerIter,
-                cfg.thinking.exploration.qualityFloor
+                cfg.thinking.exploration.qualityFloor,
+                cfg.thinking.exploration.earlyStopConfidence,
+                cfg.thinking.exploration.parallel,
+                cfg.thinking.exploration.parallelism
         );
 
         Retriever retriever = new KnowledgeRetriever(
                 kernel.knowledge(),
                 scorer,
                 new SoftmaxSampler(),
-                expl
+                expl,
+                12 //CacheCapacity
         );
 
         // --- Deterministic intent + advanced evaluation ---
