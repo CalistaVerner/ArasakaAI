@@ -1,0 +1,23 @@
+{
+  "baseDir": "data",
+  "corpora": {
+    "dir": "corpora",
+    "bootstrap": ["base.jsonl", "architecture.jsonl", "learning.jsonl", "domain/java.jsonl"],
+    "failFast": false
+  },
+  "knowledge": {
+    "snapshotFile": "knowledge.snapshot.jsonl",
+    "autoSnapshotEveryTurns": 5
+  },
+  "events": { "logFile": "events.jsonl" },
+  "thinking": {
+    "iterations": 4,
+    "retrieveK": 10,
+    "exploration": { "temperature": 0.8, "topK": 40 }
+  },
+  "learning": {
+    "enabled": true,
+    "newStatementWeight": 0.35,
+    "reinforceStep": 0.05
+  }
+}

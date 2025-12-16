@@ -1,0 +1,48 @@
+plugins {
+    id 'java'
+}
+
+group = 'com.calista'
+version = '1.0-SNAPSHOT'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+    maven { url 'https://jitpack.io' }
+    maven { url 'https://repo.spring.io/milestone' }
+    maven { url 'https://maven.google.com' }
+}
+
+dependencies {
+    // --- BOM'ы для единых версий ---
+    implementation platform("org.apache.logging.log4j:log4j-bom:2.25.2")   // актуальный Log4j2 :contentReference[oaicite:2]{index=2}
+    implementation platform("com.fasterxml.jackson:jackson-bom:2.19.0")     // согласованные версии Jackson :contentReference[oaicite:3]{index=3}
+    implementation "com.fasterxml.jackson.datatype:jackson-datatype-jsr310"
+
+    // --- Логирование: SLF4J API + провайдер Log4j2 ---
+    implementation "org.slf4j:slf4j-api:2.0.9"
+    implementation "org.apache.logging.log4j:log4j-api"
+    implementation "org.apache.logging.log4j:log4j-core"
+
+    // --- TensorFlow Java ---
+    implementation "org.tensorflow:tensorflow-core-platform:1.1.0" // релиз 2025-06-23 :contentReference[oaicite:5]{index=5}
+
+    // --- JSON ---
+    implementation "com.fasterxml.jackson.core:jackson-databind"
+
+    // --- Console colors (опционально) ---
+    runtimeOnly "org.fusesource.jansi:jansi:2.4.0"
+
+    // --- Тесты ---
+    testImplementation platform("org.junit:junit-bom:5.10.2")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+}
+
+test {
+    useJUnitPlatform()
+}

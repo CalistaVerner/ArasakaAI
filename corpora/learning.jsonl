@@ -1,0 +1,2 @@
+{"id":"learning.reinforcement","text":"Повторяющиеся или подтверждённые знания усиливаются по весу.","weight":0.8,"tags":["learning"]}
+{"id":"learning.new_knowledge","text":"Новые знания добавляются с пониженным начальным весом.","weight":0.6,"tags":["learning"]}

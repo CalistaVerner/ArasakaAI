@@ -1,0 +1,2 @@
+{"id":"java.immutability","text":"Неизменяемые объекты упрощают потокобезопасность.","weight":0.8,"tags":["java","concurrency"]}
+{"id":"java.nio","text":"java.nio предоставляет неблокирующий ввод-вывод и каналы.","weight":0.7,"tags":["java","io"]}

@@ -1,0 +1,65 @@
+{
+  "lexemes": [
+
+    { "lemma": "калиста", "pos": "PROPN", "tags": ["ai", "identity"] },
+    { "lemma": "я", "pos": "PRON", "tags": ["self"] },
+    { "lemma": "ты", "pos": "PRON", "tags": ["other"] },
+    { "lemma": "пользователь", "pos": "NOUN", "tags": ["human", "agent"] },
+    { "lemma": "ассистент", "pos": "NOUN", "tags": ["ai", "agent"] },
+
+    { "lemma": "данные", "pos": "NOUN", "tags": ["information"] },
+    { "lemma": "информация", "pos": "NOUN", "tags": ["information"] },
+    { "lemma": "факт", "pos": "NOUN", "tags": ["information", "memory"] },
+    { "lemma": "память", "pos": "NOUN", "tags": ["memory", "system"] },
+    { "lemma": "контекст", "pos": "NOUN", "tags": ["context"] },
+
+    { "lemma": "анализировать", "pos": "VERB", "tags": ["cognition"] },
+    { "lemma": "понимать", "pos": "VERB", "tags": ["cognition"] },
+    { "lemma": "объяснять", "pos": "VERB", "tags": ["communication"] },
+    { "lemma": "сравнивать", "pos": "VERB", "tags": ["cognition"] },
+    { "lemma": "оценивать", "pos": "VERB", "tags": ["cognition"] },
+
+    { "lemma": "обучение", "pos": "NOUN", "tags": ["learning"] },
+    { "lemma": "обучаться", "pos": "VERB", "tags": ["learning"] },
+    { "lemma": "коррекция", "pos": "NOUN", "tags": ["adjustment"] },
+    { "lemma": "адаптация", "pos": "NOUN", "tags": ["adjustment"] },
+    { "lemma": "оптимизировать", "pos": "VERB", "tags": ["efficiency"] },
+
+    { "lemma": "модель", "pos": "NOUN", "tags": ["system"] },
+    { "lemma": "алгоритм", "pos": "NOUN", "tags": ["system"] },
+    { "lemma": "механизм", "pos": "NOUN", "tags": ["system"] },
+    { "lemma": "процесс", "pos": "NOUN", "tags": ["system"] },
+
+    { "lemma": "связь", "pos": "NOUN", "tags": ["neural"] },
+    { "lemma": "связи", "pos": "NOUN", "tags": ["neural"] },
+    { "lemma": "ассоциация", "pos": "NOUN", "tags": ["neural"] },
+    { "lemma": "структура", "pos": "NOUN", "tags": ["structure"] },
+    { "lemma": "паттерн", "pos": "NOUN", "tags": ["structure"] },
+
+    { "lemma": "запрос", "pos": "NOUN", "tags": ["dialog", "control"] },
+    { "lemma": "вопрос", "pos": "NOUN", "tags": ["dialog"] },
+    { "lemma": "ответ", "pos": "NOUN", "tags": ["dialog"] },
+    { "lemma": "сообщение", "pos": "NOUN", "tags": ["dialog"] },
+
+    { "lemma": "что", "pos": "PRON", "tags": ["question"] },
+    { "lemma": "как", "pos": "ADV", "tags": ["question"] },
+    { "lemma": "почему", "pos": "ADV", "tags": ["question"] },
+    { "lemma": "зачем", "pos": "ADV", "tags": ["question"] },
+    { "lemma": "когда", "pos": "ADV", "tags": ["question"] },
+
+    { "lemma": "важный", "pos": "ADJ", "tags": ["quality"] },
+    { "lemma": "точный", "pos": "ADJ", "tags": ["quality"] },
+    { "lemma": "логичный", "pos": "ADJ", "tags": ["quality"] },
+    { "lemma": "понятный", "pos": "ADJ", "tags": ["quality"] },
+
+    { "lemma": "сказать", "pos": "VERB", "tags": ["communication"] },
+    { "lemma": "спросить", "pos": "VERB", "tags": ["communication"] },
+    { "lemma": "уточнить", "pos": "VERB", "tags": ["communication"] },
+
+    { "lemma": "если", "pos": "SCONJ", "tags": ["logic"] },
+    { "lemma": "то", "pos": "PART", "tags": ["logic"] },
+    { "lemma": "потому", "pos": "ADV", "tags": ["logic"] },
+    { "lemma": "поэтому", "pos": "ADV", "tags": ["logic"] }
+
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "dataDir" : "data",
+  "modelPath" : "data/model.json",
+  "lexiconPath" : "classpath:/dictionary.json",
+  "corpusPath" : "classpath:/corpus.txt",
+  "maxReplyLen" : 12,
+  "onlineLearning" : true,
+  "autosaveEveryNMessages" : 10,
+  "logConversations" : true,
+  "loggingLevel" : "DEBUG",
+  "responseGenerationStrategy" : "ARGMAX",
+  "contextWindowSize" : 5,
+  "corpusUpdateStrategy" : "INCREMENTAL",
+  "cacheModel" : true,
+  "saveModelOnExit" : true,
+  "conversationLogFile" : "data/conversations.log",
+  "lexiconUpdateStrategy" : "AUTO",
+  "tokenization" : {
+    "method" : "WHITESPACE",
+    "additionalDelimiters" : [";", ",", "."],
+    "normalizeCase" : true
+  },
+  "modelSettings": {
+    "ngramOrder" : 2,
+    "smoothness" : 0.01,
+    "associationThreshold" : 0.05
+  }
+}
