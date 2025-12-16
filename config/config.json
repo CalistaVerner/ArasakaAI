@@ -13,7 +13,9 @@
   "thinking": {
     "iterations": 4,
     "retrieveK": 10,
-    "exploration": { "temperature": 0.8, "topK": 40 }
+    "exploration": {
+      "temperature": 0.8,
+      "topK": 40 }
   },
   "learning": {
     "enabled": true,

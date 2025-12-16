@@ -1,4 +1,4 @@
-package org.calista.arasaka.ai.app;
+package org.calista.arasaka.ai;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -6,19 +6,20 @@ import org.calista.arasaka.ai.core.AIComposer;
 import org.calista.arasaka.ai.core.AIKernel;
 import org.calista.arasaka.ai.events.AIEvent;
 import org.calista.arasaka.ai.learn.SimpleLearner;
-import org.calista.arasaka.ai.text.SimpleTokenizer;
+import org.calista.arasaka.ai.tokenizer.impl.AdvancedTokenizer;
 
 import java.nio.file.Path;
 import java.util.Scanner;
 
 public final class AIApp {
     private static final Logger log = LogManager.getLogger(AIApp.class);
+
     public static void main(String[] args) throws Exception {
         Path cfg = args.length > 0 ? Path.of(args[0]) : Path.of("config/config.json");
         AIKernel kernel = AIKernel.boot(cfg);
 
-        var tokenizer = new SimpleTokenizer();
-        var engine = AIComposer.buildThinking(kernel.config(), kernel.knowledge());
+        var tokenizer = new AdvancedTokenizer();
+        var engine = AIComposer.buildThinking(kernel, tokenizer);
 
         SimpleLearner learner = new SimpleLearner(
                 kernel.knowledge(),

@@ -1,4 +1,4 @@
-package org.calista.arasaka.ai.think;
+package org.calista.arasaka.ai.think.intent;
 
 public enum Intent {
     GREETING,

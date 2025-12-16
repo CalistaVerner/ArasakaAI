@@ -1,7 +1,7 @@
 package org.calista.arasaka.ai.retrieve;
 
 import org.calista.arasaka.ai.knowledge.Statement;
-import org.calista.arasaka.ai.text.Tokenizer;
+import org.calista.arasaka.ai.tokenizer.Tokenizer;
 
 import java.util.HashSet;
 import java.util.List;

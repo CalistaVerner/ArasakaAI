@@ -2,7 +2,7 @@ package org.calista.arasaka.ai.learn;
 
 import org.calista.arasaka.ai.knowledge.KnowledgeBase;
 import org.calista.arasaka.ai.knowledge.Statement;
-import org.calista.arasaka.ai.text.Tokenizer;
+import org.calista.arasaka.ai.tokenizer.Tokenizer;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;

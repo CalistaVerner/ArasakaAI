@@ -14,5 +14,8 @@ public final class Statement {
     public void validate() {
         if (id == null || id.isBlank()) throw new IllegalArgumentException("Statement.id is required");
         if (text == null || text.isBlank()) throw new IllegalArgumentException("Statement.text is required");
+        if (!Double.isFinite(weight) || weight <= 0) weight = 1.0; // sanitize
+        if (tags == null) tags = List.of();
     }
+
 }

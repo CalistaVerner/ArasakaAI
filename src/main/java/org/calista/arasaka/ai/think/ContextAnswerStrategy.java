@@ -1,185 +1,236 @@
 package org.calista.arasaka.ai.think;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.calista.arasaka.ai.knowledge.Statement;
+import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
+import org.calista.arasaka.ai.think.intent.Intent;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
-import java.util.Objects;
+import java.util.*;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
-/**
- * Единственная "умная" стратегия ответа:
- *  - собирает ответ по секциям (краткий вывод → аргументы из контекста → шаги)
- *  - самоисправляется (используя state.bestSoFar и state.lastCritique)
- *  - готова к подключению BeamSearch/TensorFlow генератора (через state.generator)
- */
 public final class ContextAnswerStrategy implements ResponseStrategy {
-    private static final Logger log = LogManager.getLogger(ContextAnswerStrategy.class);
 
-    private final int maxContextBullets;
+    // Tokenization for deterministic lightweight relevance.
+    private static final Pattern WORD = Pattern.compile("[\\p{L}\\p{Nd}_]{3,}");
 
-    public ContextAnswerStrategy() {
-        this(6);
+    private static String summarize(String userText, List<Statement> ctx, ThoughtState state) {
+        // Use bestSoFar as anchor if it exists (stability across iterations).
+        if (state != null && state.bestSoFar != null && state.bestSoFar.text != null && !state.bestSoFar.text.isBlank()) {
+            String best = extractSection1(state.bestSoFar.text);
+            if (!best.isBlank()) return truncate(best, 220);
+        }
+        if (ctx == null || ctx.isEmpty()) return truncate(userText, 200);
+        return truncate(String.valueOf(ctx.get(0).text), 240);
     }
 
-    public ContextAnswerStrategy(int maxContextBullets) {
-        this.maxContextBullets = Math.max(2, maxContextBullets);
+    private static String arguments(List<Statement> ctx, ThoughtState state) {
+        if (ctx == null || ctx.isEmpty()) return "• (no_context)";
+
+        Set<String> ltmIds = (state == null || state.recalledMemory == null)
+                ? Set.of()
+                : state.recalledMemory.stream()
+                .filter(Objects::nonNull)
+                .map(s -> s.id)
+                .filter(id -> id != null && !id.isBlank())
+                .collect(Collectors.toSet());
+
+        return ctx.stream()
+                .filter(Objects::nonNull)
+                .limit(8)
+                .map(s -> {
+                    String id = s.id;
+                    String t = (s.text == null) ? "" : s.text;
+                    String p = (id != null && !id.isBlank() && ltmIds.contains(id)) ? "• [LTM] " : "• ";
+                    return p + truncate(t, 240);
+                })
+                .collect(Collectors.joining("\n"));
+    }
+
+    private static String steps(List<Statement> ctx, ThoughtState state) {
+        StringBuilder sb = new StringBuilder();
+
+        // Deterministic self-correction plan derived from last evaluation signals.
+        CandidateEvaluator.Evaluation last = state == null ? null : state.lastEvaluation;
+        if (last != null) {
+            if (!last.valid) sb.append("- fix=validity\n");
+            if (last.groundedness < 0.35) sb.append("- fix=more_evidence\n");
+            if (last.contradictionRisk > 0.60) sb.append("- fix=reduce_unbacked_claims\n");
+        }
+
+        // Include machine critique tokens if present.
+        if (state != null && state.lastCritique != null && !state.lastCritique.isBlank()) {
+            sb.append("- notes=").append(truncate(state.lastCritique.replace('\n', ' '), 260)).append('\n');
+        }
+
+        // Concrete next steps grounded in context.
+        if (ctx != null) {
+            for (Statement s : ctx.stream().filter(Objects::nonNull).limit(4).toList()) {
+                sb.append("- ").append(truncate(String.valueOf(s.text), 220)).append('\n');
+            }
+        }
+
+        return sb.toString().trim();
+    }
+
+    private static List<Statement> rankContext(String userText, List<Statement> context) {
+        if (context == null || context.isEmpty()) return List.of();
+        Set<String> q = tokens(userText);
+
+        return context.stream()
+                .filter(Objects::nonNull)
+                .sorted(Comparator
+                        .comparingInt((Statement s) -> overlap(tokens(String.valueOf(s.text)), q))
+                        .reversed()
+                        .thenComparing(s -> String.valueOf(s.text)))
+                .toList();
+    }
+
+    private static Set<String> tokens(String s) {
+        if (s == null || s.isBlank()) return Set.of();
+        return WORD.matcher(s.toLowerCase(Locale.ROOT))
+                .results()
+                .map(r -> r.group())
+                .limit(256)
+                .collect(Collectors.toSet());
+    }
+
+    private static int overlap(Set<String> a, Set<String> b) {
+        if (a.isEmpty() || b.isEmpty()) return 0;
+        int c = 0;
+        for (String t : a) if (b.contains(t)) c++;
+        return c;
+    }
+
+    private static String extractSection1(String text) {
+        // Back-compat: try old numeric contract; fall back to first markdown section.
+        if (text == null) return "";
+
+        int idx = text.indexOf("1)");
+        if (idx >= 0) {
+            int start = idx + 2;
+            int end = text.indexOf("2)", start);
+            if (end < 0) end = Math.min(text.length(), start + 260);
+            return text.substring(start, end).trim();
+        }
+
+        // Markdown: take content after first "##" header until next header.
+        int h = text.indexOf("##");
+        if (h >= 0) {
+            int startBody = text.indexOf('\n', h);
+            if (startBody >= 0) {
+                startBody++;
+                int next = text.indexOf("\n##", startBody);
+                if (next < 0) next = Math.min(text.length(), startBody + 260);
+                return text.substring(startBody, next).trim();
+            }
+        }
+
+        // Plain fallback: first non-empty line.
+        for (String line : text.split("\\R")) {
+            String t = line.trim();
+            if (!t.isEmpty()) return t;
+        }
+        return "";
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max);
     }
 
     @Override
     public boolean supports(Intent intent) {
-        // "Единая стратегия" — работает для любого интента.
-        return true;
+        return true; // single "smart" strategy
     }
 
     @Override
     public String generate(String userText, List<Statement> context, ThoughtState state) {
-        Objects.requireNonNull(state, "state");
-        String user = userText == null ? "" : userText.trim();
-        List<Statement> ctx = context == null ? List.of() : context;
+        Objects.requireNonNull(state);
 
-        String bestHint = bestSoFarHint(state);
-        String critiqueHint = critiqueHint(state);
+        // Sort context deterministically by relevance to the query (no ML / no magic).
+        List<Statement> ranked = rankContext(userText, context);
 
-        String summary = draftSummary(user, ctx, state, bestHint, critiqueHint);
-        List<String> bullets = buildContextBullets(user, ctx, state);
-        String steps = draftSteps(user, ctx, state, bestHint, critiqueHint);
+        String section1 = summarize(userText, ranked, state);
+        String section2 = arguments(ranked, state);
+        String section3 = steps(ranked, state);
 
-        String answer = assemble(summary, bullets, steps);
-        answer = sanitize(answer);
+        // ---- format contract (configurable via state.tags) ----
+        // Caller/engine may set:
+        //   response.style = md|plain
+        //   response.sections = summary,evidence,actions
+        //   response.label.summary / evidence / actions
+        // Defaults are deterministic and locale-aware.
 
-        log.debug("strategy.generate iter={} intent={} ctx={} summaryChars={} stepsChars={} hasGenerator={}",
-                state.iteration, state.intent, ctx.size(), summary.length(), steps.length(), state.generator != null);
-        return answer;
+        Locale locale = localeOf(userText);
+        String style = tag(state, "response.style", "md");
+        String sections = tag(state, "response.sections", "summary,evidence,actions");
+
+        String labelSummary = tag(state, "response.label.summary", defaultLabel("summary", locale));
+        String labelEvidence = tag(state, "response.label.evidence", defaultLabel("evidence", locale));
+        String labelActions = tag(state, "response.label.actions", defaultLabel("actions", locale));
+
+        Map<String, String> blocks = new HashMap<>();
+        blocks.put("summary", section1);
+        blocks.put("evidence", section2);
+        blocks.put("actions", section3);
+
+        Map<String, String> labels = Map.of(
+                "summary", labelSummary,
+                "evidence", labelEvidence,
+                "actions", labelActions
+        );
+
+        return render(sections, style, blocks, labels);
     }
 
-    private String draftSummary(String user, List<Statement> ctx, ThoughtState state, String bestHint, String critiqueHint) {
-        if (state.generator != null) {
-            String out = state.generator.generate(user, ctx, state);
-            if (out != null && out.trim().length() >= 40) {
-                return out.trim();
+    private static String tag(ThoughtState state, String key, String def) {
+        if (state == null || state.tags == null) return def;
+        String v = state.tags.get(key);
+        return (v == null || v.isBlank()) ? def : v;
+    }
+
+    private static String render(String sectionsCsv,
+                                 String style,
+                                 Map<String, String> blocks,
+                                 Map<String, String> labels) {
+        String[] parts = (sectionsCsv == null ? "" : sectionsCsv).split("\\s*,\\s*");
+        boolean md = style != null && style.toLowerCase(Locale.ROOT).contains("md");
+
+        StringBuilder out = new StringBuilder(1400);
+        for (String p : parts) {
+            if (p == null || p.isBlank()) continue;
+            String key = p.trim().toLowerCase(Locale.ROOT);
+            String label = labels.getOrDefault(key, key);
+            String body = blocks.getOrDefault(key, "").trim();
+            if (body.isBlank()) continue;
+
+            if (md) {
+                out.append("## ").append(label).append('\n');
+                out.append(body).append("\n\n");
+            } else {
+                out.append(label).append(':').append('\n');
+                out.append(body).append("\n\n");
             }
         }
-
-        String topic = pickTopic(user);
-        if (state.intent == Intent.GREETING) {
-            return "Привет! Давай сделаем это по-взрослому. Скажи, какой результат ты хочешь на выходе (код, план, архитектура, тесты)?";
-        }
-        if (topic.isBlank()) {
-            return "Ок. Сформулирую ответ так, чтобы он был проверяемым: вывод, опора на контекст, и конкретные шаги.";
-        }
-        String prefix = (state.iteration <= 1)
-                ? "Суть: "
-                : "Уточнил и улучшил: ";
-
-        String improve = (critiqueHint.isBlank() ? "" : (" (учёл: " + critiqueHint + ")"));
-        return prefix + "по теме «" + topic + "» можно построить решение как конвейер: выбор данных → сбор черновика → валидация → улучшение." + improve;
+        return out.toString().trim();
     }
 
-    private String draftSteps(String user, List<Statement> ctx, ThoughtState state, String bestHint, String critiqueHint) {
-        if (state.generator != null) {
-            String prevHint = state.generationHint;
-            state.generationHint = "steps";
-            try {
-                String out = state.generator.generate(user, ctx, state);
-                if (out != null && out.trim().length() >= 40) return out.trim();
-            } finally {
-                state.generationHint = prevHint;
-            }
+    private static Locale localeOf(String s) {
+        if (s == null) return Locale.ROOT;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= 'А' && c <= 'я') return new Locale("ru");
         }
-
-        ArrayList<String> steps = new ArrayList<>(6);
-        steps.add("Сделать единый цикл: retrieve(query) → draft(answer) → evaluate(metrics) → revise(query/answer) с ранней остановкой.");
-        steps.add("Перенести критику внутрь CandidateEvaluator (метрики + текст критики), а движок держать тупым и чистым.");
-        steps.add("Стратегия ответа всегда выдаёт: (1) вывод, (2) аргументы из контекста, (3) шаги и проверки.");
-        steps.add("Валидация: проверять покрытие запроса, опору на контекст, стиль (не раскрывать внутренности), и наличие следующего действия.");
-        steps.add("Подготовить интерфейс TextGenerator и подключить BeamSearchResponder/TensorFlow как backend без изменения движка.");
-
-        if (!critiqueHint.isBlank()) {
-            steps.add("Адресно улучшить: " + critiqueHint + ".");
-        }
-        if (!bestHint.isBlank() && state.iteration >= 2) {
-            steps.add("Слить лучшее из прошлой версии с текущими правками (bestSoFar) и пересчитать оценку.");
-        }
-
-        StringBuilder sb = new StringBuilder(600);
-        for (int i = 0; i < steps.size(); i++) {
-            sb.append(i + 1).append(") ").append(steps.get(i)).append('\n');
-        }
-        return sb.toString().trim();
+        return Locale.ROOT;
     }
 
-    private List<String> buildContextBullets(String user, List<Statement> ctx, ThoughtState state) {
-        int limit = Math.min(maxContextBullets, ctx.size());
-        if (limit == 0) {
-            return List.of("Контекст пока пустой — либо расширь базу знаний, либо уточни формулировку (что именно строим: retrieval, генерация, оценка, память?).");
-        }
-        ArrayList<String> out = new ArrayList<>(limit);
-        for (int i = 0; i < limit; i++) {
-            String t = ctx.get(i).text == null ? "" : ctx.get(i).text.trim();
-            if (!t.isBlank()) out.add(t);
-        }
-        if (out.size() < maxContextBullets && state.iteration >= 2 && !state.lastCritique.isBlank() && ctx.size() > out.size()) {
-            String extra = ctx.get(out.size()).text == null ? "" : ctx.get(out.size()).text.trim();
-            if (!extra.isBlank()) out.add(extra);
-        }
-        return List.copyOf(out);
-    }
-
-    private static String assemble(String summary, List<String> bullets, String steps) {
-        StringBuilder sb = new StringBuilder(1400);
-
-        sb.append(summary == null ? "" : summary.trim()).append("\n\n");
-
-        sb.append("Опора на контекст:\n");
-        for (String b : bullets) {
-            sb.append("• ").append(b).append('\n');
-        }
-
-        sb.append("\nШаги:\n");
-        sb.append(steps == null ? "" : steps.trim());
-
-        return sb.toString().trim();
-    }
-
-    private static String bestSoFarHint(ThoughtState state) {
-        if (state.bestSoFar == null || state.bestSoFar.text == null) return "";
-        String s = state.bestSoFar.text.trim();
-        if (s.isEmpty()) return "";
-        int cap = Math.min(120, s.length());
-        return s.substring(0, cap);
-    }
-
-    private static String critiqueHint(ThoughtState state) {
-        String c = state.lastCritique == null ? "" : state.lastCritique.trim();
-        if (c.isEmpty()) return "";
-        c = c.replace("итера", "");
-        if (c.length() > 180) c = c.substring(0, 180);
-        return c;
-    }
-
-    private static String sanitize(String s) {
-        if (s == null) return "";
-        String x = s;
-        x = x.replaceAll("(?i)контекст знаний\\s*:\\s*", "");
-        x = x.replaceAll("(?i)план ответа\\s*:\\s*", "");
-        x = x.replaceAll("(?i)trace\\s*:\\s*", "");
-        return x.trim();
-    }
-
-    private static String pickTopic(String user) {
-        if (user == null) return "";
-        String u = user.trim();
-        if (u.isEmpty()) return "";
-        int cut = u.indexOf('\n');
-        if (cut < 0) cut = u.indexOf('.');
-        if (cut < 0) cut = u.indexOf('!');
-        if (cut < 0) cut = u.indexOf('?');
-        if (cut < 0) cut = Math.min(64, u.length());
-        String t = u.substring(0, Math.min(cut, u.length())).trim();
-        if (t.length() > 64) t = t.substring(0, 64);
-        return t;
+    private static String defaultLabel(String key, Locale locale) {
+        boolean ru = locale != null && "ru".equalsIgnoreCase(locale.getLanguage());
+        return switch (key) {
+            case "summary" -> ru ? "Вывод" : "Conclusion";
+            case "evidence" -> ru ? "Опора на контекст" : "Evidence from context";
+            case "actions" -> ru ? "Следующие шаги" : "Next steps";
+            default -> key;
+        };
     }
 }

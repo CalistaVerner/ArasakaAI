@@ -1,4 +1,4 @@
-package org.calista.arasaka.ai.text;
+package org.calista.arasaka.ai.tokenizer;
 
 import java.util.List;
 

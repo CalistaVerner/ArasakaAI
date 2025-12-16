@@ -1,8 +1,11 @@
-package org.calista.arasaka.ai.text;
+package org.calista.arasaka.ai.tokenizer.impl;
+
+import org.calista.arasaka.ai.tokenizer.Tokenizer;
 
 import java.util.ArrayList;
 import java.util.List;
 
+@Deprecated
 public final class SimpleTokenizer implements Tokenizer {
     @Override
     public List<String> tokenize(String text) {
