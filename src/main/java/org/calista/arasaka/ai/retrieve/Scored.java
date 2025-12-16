@@ -23,6 +23,34 @@ public final class Scored<T> implements Comparable<Scored<T>> {
      * Stable key used for deterministic tie-breaks. Avoid identity-based hash codes.
      */
     public String stableKey() {
+        if (item == null) return "null";
+
+        // Fast path for common pattern: public fields id/text.
+        // We intentionally avoid any dependency on a specific model class here.
+        try {
+            Class<?> c = item.getClass();
+
+            String id = null;
+            try {
+                var fId = c.getField("id");
+                Object v = fId.get(item);
+                if (v instanceof String s && !s.isBlank()) id = s;
+            } catch (NoSuchFieldException ignored) {
+            }
+
+            String text = null;
+            try {
+                var fText = c.getField("text");
+                Object v = fText.get(item);
+                if (v instanceof String s && !s.isBlank()) text = s;
+            } catch (NoSuchFieldException ignored) {
+            }
+
+            if (id != null) return "id:" + id;
+            if (text != null) return "tx:" + text;
+        } catch (Throwable ignored) {
+        }
+
         return String.valueOf(item);
     }
 

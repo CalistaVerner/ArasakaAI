@@ -1,5 +1,6 @@
 plugins {
     id 'java'
+    id 'application'
 }
 
 group = 'com.calista'
@@ -18,7 +19,16 @@ repositories {
     maven { url 'https://maven.google.com' }
 }
 
+
 dependencies {
+
+    // GraalVM SDK
+    implementation("org.graalvm.sdk:graal-sdk:24.1.1")
+
+    // JavaScript engine
+    implementation("org.graalvm.js:js:24.1.1")
+    implementation("org.graalvm.js:js-scriptengine:24.1.1")
+
     // --- BOM'ы для единых версий ---
     implementation platform("org.apache.logging.log4j:log4j-bom:2.25.2")   // актуальный Log4j2 :contentReference[oaicite:2]{index=2}
     implementation platform("com.fasterxml.jackson:jackson-bom:2.19.0")     // согласованные версии Jackson :contentReference[oaicite:3]{index=3}

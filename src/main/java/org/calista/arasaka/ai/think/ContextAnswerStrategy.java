@@ -1,7 +1,6 @@
 package org.calista.arasaka.ai.think;
 
 import org.calista.arasaka.ai.knowledge.Statement;
-import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.think.intent.Intent;
 
 import java.util.*;
@@ -24,7 +23,8 @@ public final class ContextAnswerStrategy implements ResponseStrategy {
     }
 
     private static String arguments(List<Statement> ctx, ThoughtState state) {
-        if (ctx == null || ctx.isEmpty()) return "• (no_context)";
+        // No magic markers in user-visible output. If no evidence, omit the section.
+        if (ctx == null || ctx.isEmpty()) return "";
 
         Set<String> ltmIds = (state == null || state.recalledMemory == null)
                 ? Set.of()
@@ -47,28 +47,18 @@ public final class ContextAnswerStrategy implements ResponseStrategy {
     }
 
     private static String steps(List<Statement> ctx, ThoughtState state) {
-        StringBuilder sb = new StringBuilder();
+        // This block is user-visible. Keep it clean: no internal markers (fix=..., notes=...).
+        // If you want self-critique / repair guidance, feed it via ThoughtState.generationHint
+        // so the generator can self-correct without leaking telemetry into the final answer.
 
-        // Deterministic self-correction plan derived from last evaluation signals.
-        CandidateEvaluator.Evaluation last = state == null ? null : state.lastEvaluation;
-        if (last != null) {
-            if (!last.valid) sb.append("- fix=validity\n");
-            if (last.groundedness < 0.35) sb.append("- fix=more_evidence\n");
-            if (last.contradictionRisk > 0.60) sb.append("- fix=reduce_unbacked_claims\n");
+        if (ctx == null || ctx.isEmpty()) return "";
+
+        StringBuilder sb = new StringBuilder(320);
+        for (Statement s : ctx.stream().filter(Objects::nonNull).limit(4).toList()) {
+            String t = String.valueOf(s.text).trim();
+            if (t.isEmpty()) continue;
+            sb.append("- ").append(truncate(t, 220)).append('\n');
         }
-
-        // Include machine critique tokens if present.
-        if (state != null && state.lastCritique != null && !state.lastCritique.isBlank()) {
-            sb.append("- notes=").append(truncate(state.lastCritique.replace('\n', ' '), 260)).append('\n');
-        }
-
-        // Concrete next steps grounded in context.
-        if (ctx != null) {
-            for (Statement s : ctx.stream().filter(Objects::nonNull).limit(4).toList()) {
-                sb.append("- ").append(truncate(String.valueOf(s.text), 220)).append('\n');
-            }
-        }
-
         return sb.toString().trim();
     }
 
@@ -153,13 +143,6 @@ public final class ContextAnswerStrategy implements ResponseStrategy {
         String section1 = summarize(userText, ranked, state);
         String section2 = arguments(ranked, state);
         String section3 = steps(ranked, state);
-
-        // ---- format contract (configurable via state.tags) ----
-        // Caller/engine may set:
-        //   response.style = md|plain
-        //   response.sections = summary,evidence,actions
-        //   response.label.summary / evidence / actions
-        // Defaults are deterministic and locale-aware.
 
         Locale locale = localeOf(userText);
         String style = tag(state, "response.style", "md");

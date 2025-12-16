@@ -2,20 +2,36 @@
   "baseDir": "data",
   "corpora": {
     "dir": "corpora",
-    "bootstrap": ["base.jsonl", "architecture.jsonl", "learning.jsonl", "domain/java.jsonl"],
+    "bootstrap": ["arasaka.core.jsonl", "arasaka.values.jsonl", "arasaka.constraits.jsonl", "domain/java.jsonl"],
     "failFast": false
   },
   "knowledge": {
     "snapshotFile": "knowledge.snapshot.jsonl",
     "autoSnapshotEveryTurns": 5
   },
-  "events": { "logFile": "events.jsonl" },
+  "events": {
+    "logFile": "events.jsonl"
+  },
   "thinking": {
+    "engine": "beam",
     "iterations": 4,
     "retrieveK": 10,
     "exploration": {
       "temperature": 0.8,
-      "topK": 40 }
+      "topK": 40,
+      "iterations": 3,
+      "candidateMultiplier": 4,
+      "diversity": 0.18,
+      "minScore": 1e-9,
+      "iterationDecay": 0.72,
+      "refineTerms": 14,
+      "candidateGateMinTokenLen": 3,
+      "maxCandidatesPerIter": 120000,
+      "qualityFloor": 0.0,
+      "earlyStopConfidence":  0.0,
+      "parallel": false,
+      "parallelism": 0
+    }
   },
   "learning": {
     "enabled": true,

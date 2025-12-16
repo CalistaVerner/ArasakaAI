@@ -29,17 +29,20 @@ public final class SoftmaxSampler implements ExplorationStrategy {
                 ? new HashMap<>(pool.size() * 2)
                 : null;
 
-        final ArrayList<Integer> remaining = new ArrayList<>(pool.size());
-        for (int i = 0; i < pool.size(); i++) remaining.add(i);
+        // Deterministic and fast: keep remaining indices in a compact int[] and swap-remove.
+        int[] remaining = new int[pool.size()];
+        for (int i = 0; i < pool.size(); i++) remaining[i] = i;
+        int remainingSize = pool.size();
 
         final ArrayList<T> out = new ArrayList<>(need);
         final ArrayList<Integer> chosenIdx = new ArrayList<>(need);
 
-        for (int pick = 0; pick < need && !remaining.isEmpty(); pick++) {
+        for (int pick = 0; pick < need && remainingSize > 0; pick++) {
             int bestIdx = -1;
             double best = Double.NEGATIVE_INFINITY;
 
-            for (int idx : remaining) {
+            for (int r = 0; r < remainingSize; r++) {
+                int idx = remaining[r];
                 Scored<T> cand = pool.get(idx);
 
                 double base = cand.score / cfg.temperature;
@@ -70,8 +73,14 @@ public final class SoftmaxSampler implements ExplorationStrategy {
             out.add(pool.get(bestIdx).item);
             chosenIdx.add(bestIdx);
 
-            int finalBestIdx = bestIdx;
-            remaining.removeIf(i -> i == finalBestIdx);
+            // swap-remove from remaining
+            for (int r = 0; r < remainingSize; r++) {
+                if (remaining[r] == bestIdx) {
+                    remaining[r] = remaining[remainingSize - 1];
+                    remainingSize--;
+                    break;
+                }
+            }
         }
 
         return out;

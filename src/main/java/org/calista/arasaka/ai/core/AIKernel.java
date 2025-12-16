@@ -8,6 +8,8 @@ import org.calista.arasaka.ai.knowledge.InMemoryKnowledgeBase;
 import org.calista.arasaka.ai.knowledge.KnowledgeBase;
 import org.calista.arasaka.ai.knowledge.KnowledgeSnapshotStore;
 import org.calista.arasaka.io.FileIO;
+import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.HostAccess;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -21,6 +23,7 @@ public final class AIKernel {
     private final KnowledgeBase kb;
     private final EventStore events;
     private final KnowledgeSnapshotStore snapshots;
+    private final Context JS_CONTEXT;
 
     private AIKernel(FileIO io, ObjectMapper mapper, AIConfig cfg, KnowledgeBase kb, EventStore events, KnowledgeSnapshotStore snapshots) {
         this.io = io;
@@ -29,6 +32,7 @@ public final class AIKernel {
         this.kb = kb;
         this.events = events;
         this.snapshots = snapshots;
+        JS_CONTEXT = Context.newBuilder("js").allowHostAccess(HostAccess.NONE).option("engine.WarnInterpreterOnly", "false").allowIO(false).build();
     }
 
     public static AIKernel boot(Path configFile) throws IOException {
@@ -61,4 +65,8 @@ public final class AIKernel {
     public KnowledgeBase knowledge() { return kb; }
     public EventStore eventStore() { return events; }
     public KnowledgeSnapshotStore snapshotStore() { return snapshots; }
+
+    public Context getJS_CONTEXT() {
+        return JS_CONTEXT;
+    }
 }

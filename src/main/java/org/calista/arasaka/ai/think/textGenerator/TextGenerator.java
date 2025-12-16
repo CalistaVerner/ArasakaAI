@@ -1,31 +1,35 @@
-package org.calista.arasaka.ai.think;
+package org.calista.arasaka.ai.think.textGenerator;
 
 import org.calista.arasaka.ai.knowledge.Statement;
+import org.calista.arasaka.ai.think.ThoughtState;
 
 import java.util.ArrayList;
 import java.util.List;
 
 /**
  * Pluggable generation backend.
- * <p>
+ *
  * Determinism contract:
  * - deterministic for same (userText, context, state)
  * - for multi-draft use (state.seed, state.draftIndex) as conditioning
  */
-@FunctionalInterface
 public interface TextGenerator {
 
+    /**
+     * Generate a draft given userText (or prepared prompt), context, and state.
+     * Contract: deterministic for the same inputs.
+     */
     String generate(String userText, List<Statement> context, ThoughtState state);
 
     /**
      * Prepare a deterministic generation prompt derived from {@link ThoughtState#generationHint}.
-     * <p>
-     * This is intentionally <b>domain-agnostic</b>: it only encodes formatting and quality constraints
+     *
+     * This is intentionally domain-agnostic: it only encodes formatting and quality constraints
      * (grounding / avoiding unsupported claims / using evidence). BeamSearch/TensorFlow backends can
      * treat it as a stable "system" prefix.
      *
-     * <p>Contract: for same (userText, context, state.generationHint, state.bestSoFar, state.lastCritique)
-     * the result must be identical.</p>
+     * Contract: for same (userText, context, state.generationHint, state.bestSoFar, state.lastCritique)
+     * the result must be identical.
      */
     default String prepareUserText(String userText, List<Statement> context, ThoughtState state) {
         String q = userText == null ? "" : userText.trim();
@@ -76,7 +80,7 @@ public interface TextGenerator {
         int need = Math.max(1, n);
         ArrayList<String> out = new ArrayList<>(need);
         for (int i = 0; i < need; i++) {
-            state.draftIndex = i;
+            if (state != null) state.draftIndex = i;
             // Feed a conditioning prefix based on generationHint (still deterministic).
             String prompt = prepareUserText(userText, context, state);
             String s = generate(prompt, context, state);

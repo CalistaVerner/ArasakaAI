@@ -2,13 +2,13 @@ package org.calista.arasaka.ai.think.engine;
 
 import org.calista.arasaka.ai.retrieve.retriver.Retriever;
 import org.calista.arasaka.ai.think.ContextAnswerStrategy;
-import org.calista.arasaka.ai.think.TextGenerator;
+import org.calista.arasaka.ai.think.textGenerator.TextGenerator;
 import org.calista.arasaka.ai.think.ThoughtResult;
 import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.think.candidate.impl.AdvancedCandidateEvaluator;
 import org.calista.arasaka.ai.think.engine.impl.IterativeThoughtEngine;
 import org.calista.arasaka.ai.think.intent.IntentDetector;
-import org.calista.arasaka.ai.think.intent.impl.SimpleIntentDetector;
+import org.calista.arasaka.ai.think.intent.impl.AdvancedIntentDetector;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
 
 import java.time.Clock;
@@ -49,7 +49,11 @@ public interface ThoughtCycleEngine {
         private final Retriever retriever;
         private final Tokenizer tokenizer;
 
-        private IntentDetector intentDetector = new SimpleIntentDetector();
+        /**
+         * Default: AdvancedIntentDetector with empty (data-driven) weights.
+         * In bootstrap you should load weights/priors from KB/LTM/config and inject here.
+         */
+        private IntentDetector intentDetector = new AdvancedIntentDetector(AdvancedIntentDetector.Config.builder().build());
         private CandidateEvaluator evaluator; // lazily created from tokenizer
         private TextGenerator generator = null;
 

@@ -54,7 +54,6 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
     private static final Pattern MD_HEADER = Pattern.compile("(?m)^\\s*#{2,3}\\s+.+$");
 
     private static final Pattern BULLETISH = Pattern.compile("(?m)^\\s*([-*•]|\\d+\\.|\\d+\\))\\s+");
-    private static final Pattern WORDLIKE = Pattern.compile("[\\p{L}\\p{Nd}_]{2,}");
 
     public AdvancedCandidateEvaluator(Tokenizer tokenizer) {
         this(
@@ -103,20 +102,24 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
 
     @Override
     public Evaluation evaluate(String userText, String candidateText, List<Statement> context) {
+        final long t0 = System.nanoTime();
 
         final String q = userText == null ? "" : userText.trim();
         final String a = candidateText == null ? "" : candidateText.trim();
         final List<Statement> ctx = context == null ? List.of() : context;
 
+        final int tokens = safeTokenCount(a);
+
         if (a.isEmpty()) {
-            return invalid(-1.0, "err=empty");
+            return invalid(-1.0, "err=empty", tokens, System.nanoTime() - t0);
         }
         if (a.length() > maxCharsHard) {
-            return invalid(-0.6, "err=too_long_hard;len=" + a.length());
+            return invalid(-0.6, "err=too_long_hard;len=" + a.length(), tokens, System.nanoTime() - t0);
         }
 
         // ---- 1) Structure quality ----
         Structure s = structureOf(a);
+        double structureScore = structureScoreOf(s); // <<< NEW (0..1)
 
         // ---- No-context mode (chat/identity/smalltalk) ----
         // Do not invalidate short answers here; short can be fine without evidence.
@@ -155,6 +158,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
                     (0.75 * queryCoverage)
                             - (0.95 * contradictionRisk)
                             - (0.90 * stylePenalty)
+                            + (0.15 * structureScore)         // <<< NEW: поддержка структуры
                             + (0.10 * s.actionability);
 
             String telemetry = "noctx"
@@ -163,8 +167,10 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
                     + ";rep=" + fmt2(rep.repetition)
                     + ";sec=" + s.sectionCount
                     + ";md=" + s.mdHeaders
+                    + ";st=" + fmt2(structureScore)         // <<< NEW
                     + ";v=" + (valid ? 1 : 0);
 
+            long nanos = System.nanoTime() - t0;
             return new Evaluation(
                     score,
                     telemetry,
@@ -173,14 +179,17 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
                     stylePenalty,
                     0.0,                 // groundedness not applicable
                     contradictionRisk,    // in noctx: loop/uselessness risk proxy
+                    structureScore,       // <<< NEW
                     valid,
-                    telemetry
+                    telemetry,
+                    tokens,
+                    nanos
             );
         }
 
         // ---- Context mode: enforce minimal usefulness ----
         if (a.length() < minChars) {
-            return invalid(-0.8, "err=too_short;len=" + a.length());
+            return invalid(-0.8, "err=too_short;len=" + a.length(), tokens, System.nanoTime() - t0);
         }
 
         // ---- 2) Groundedness to context (max + topK mean) ----
@@ -224,6 +233,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
         // ---- 8) Validity decision ----
         boolean valid =
                 s.hasAllSections
+                        && structureScore >= 0.35                 // <<< NEW: минимум по структуре
                         && groundedness >= minGroundedness
                         && contradictionRisk <= maxContradictionRisk
                         && queryCoverage >= minQueryCoverage
@@ -234,6 +244,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
         double score =
                 (1.15 * groundedness)
                         + (0.55 * queryCoverage)
+                        + (0.25 * structureScore)                 // <<< NEW: бонус за структуру
                         - (1.05 * contradictionRisk)
                         - (1.00 * stylePenalty)
                         - (0.35 * clamp01(n.novelty))
@@ -243,7 +254,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
         double contextSupport = groundedness;
 
         String telemetry = telemetry(
-                s, g, groundedness,
+                s, structureScore, g, groundedness,
                 queryCoverage,
                 n,
                 rep,
@@ -254,6 +265,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
                 valid
         );
 
+        long nanos = System.nanoTime() - t0;
         return new Evaluation(
                 score,
                 telemetry,
@@ -262,8 +274,11 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
                 stylePenalty,
                 groundedness,
                 contradictionRisk,
+                structureScore,     // <<< NEW
                 valid,
-                telemetry
+                telemetry,
+                tokens,
+                nanos
         );
     }
 
@@ -274,7 +289,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
         final boolean has1, has2, has3;   // legacy markers at line-start
         final int mdHeaders;             // markdown header count
         final boolean usesMarkdown;      // true if markdown headers drive the contract
-        final double structurePenalty;   // 0..~1
+        final double structurePenalty;   // 0..1
         final double actionability;      // 0..1 (heuristic)
         final int sectionCount;          // legacy count OR md header count
 
@@ -339,6 +354,20 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
                 actionability,
                 sectionCount
         );
+    }
+
+    /**
+     * structureScore (0..1):
+     *  - базируется на (1 - penalty)
+     *  - слегка усиливается actionability (списки/шаги)
+     *  - не требует "доменных" правил
+     */
+    private static double structureScoreOf(Structure s) {
+        if (s == null) return 0.0;
+        double base = 1.0 - clamp01(s.structurePenalty);
+        double score = (0.80 * base) + (0.20 * clamp01(s.actionability));
+        if (s.hasAllSections) score += 0.05;
+        return clamp01(score);
     }
 
     // -------------------- groundedness --------------------
@@ -519,7 +548,8 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
 
     // -------------------- invalid helper --------------------
 
-    private static Evaluation invalid(double score, String note) {
+    private static Evaluation invalid(double score, String note, int tokens, long nanos) {
+        // valid=false, contradictionRisk=1.0, structureScore=0.0
         return new Evaluation(
                 score,
                 note,
@@ -528,8 +558,11 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
                 1.0,
                 0.0,
                 1.0,
+                0.0,
                 false,
-                note
+                note,
+                tokens,
+                nanos
         );
     }
 
@@ -537,6 +570,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
 
     private static String telemetry(
             Structure s,
+            double structureScore,
             GroundingAgg g,
             double groundedness,
             double queryCoverage,
@@ -555,6 +589,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
                 ";s2=" + (s.has2 ? 1 : 0) +
                 ";s3=" + (s.has3 ? 1 : 0) +
                 ";act=" + fmt2(s.actionability) +
+                ";st=" + fmt2(structureScore) +
                 ";g=" + fmt2(groundedness) +
                 ";g_best_i=" + g.bestIdx +
                 ";g_best=" + fmt2(g.bestScore) +
@@ -587,6 +622,14 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
             if (!Character.isLetterOrDigit(ch) && !Character.isWhitespace(ch)) c++;
         }
         return c;
+    }
+
+    private int safeTokenCount(String text) {
+        try {
+            return tokenizer.tokenize(text).size();
+        } catch (Exception ignored) {
+            return 0;
+        }
     }
 
     private static double clamp01(double v) {

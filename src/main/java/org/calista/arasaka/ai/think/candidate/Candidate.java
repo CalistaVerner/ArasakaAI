@@ -1,48 +1,43 @@
 package org.calista.arasaka.ai.think.candidate;
 
+import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
+
 import java.util.Objects;
 
-/**
- * A single candidate answer produced during an iteration.
- *
- * <p>Stores both the raw text and the full {@link CandidateEvaluator.Evaluation} telemetry
- * so the engine and strategies can self-correct deterministically.</p>
- */
 public final class Candidate {
-
     public final String text;
-
-    /**
-     * Primary ordering score. Typically use {@link CandidateEvaluator.Evaluation#effectiveScore()}.
-     */
     public final double score;
 
-    /**
-     * Machine-readable critique/notes (backward compatible field).
-     */
+    /** Short machine critique for refinement (NO telemetry). */
     public final String critique;
 
-    /**
-     * Full evaluation telemetry (may be {@code null} for legacy callers).
-     */
+    /** Full evaluation (may contain telemetry). */
     public final CandidateEvaluator.Evaluation evaluation;
 
-    /**
-     * Legacy constructor.
-     */
-    public Candidate(String text, double score, String critique) {
-        this(text, score, critique, null);
-    }
+    /** Optional diagnostics for logs; must NOT be used for retrieval/generation. */
+    public final String diagnostics;
 
     public Candidate(String text, double score, String critique, CandidateEvaluator.Evaluation evaluation) {
+        this(text, score, critique, evaluation, "");
+    }
+
+    public Candidate(String text, double score, String critique, CandidateEvaluator.Evaluation evaluation, String diagnostics) {
         this.text = text == null ? "" : text;
         this.score = score;
         this.critique = critique == null ? "" : critique;
         this.evaluation = evaluation;
+        this.diagnostics = diagnostics == null ? "" : diagnostics;
     }
 
-    public static Candidate fromEvaluation(String text, CandidateEvaluator.Evaluation e) {
-        Objects.requireNonNull(e, "evaluation");
-        return new Candidate(text, e.effectiveScore(), e.validationNotes, e);
+    public static Candidate fromEvaluation(String text, CandidateEvaluator.Evaluation ev) {
+        String shortCrit = QuantumNotes.compact(ev);         // <<< ВАЖНО
+        String diag = (ev == null) ? "" : ev.validationNotes; // telemetry остаётся здесь
+        double s = (ev == null) ? Double.NEGATIVE_INFINITY : ev.effectiveScore();
+        return new Candidate(text, s, shortCrit, ev, diag);
+    }
+
+    @Override
+    public String toString() {
+        return "Candidate{score=" + score + ", critique='" + critique + "'}";
     }
 }

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="OFF">
+    <Properties>
+        <Property name="logDir">logs</Property>
+    </Properties>
+
+    <Appenders>
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout
+                    pattern="%style{[%d{HH:mm:ss}]}{bold,black} %highlight{[%p]}{FATAL=bg_red, ERROR=red, WARN=yellow, INFO=green, DEBUG=blue, TRACE=cyan} %style{%X{workerName}{[Name-%X{workerName}]}}{magenta} %style{%m}{black}%n%throwable"
+                    disableAnsi="false" />
+        </Console>
+
+        <File name="File" fileName="logs/lastlog.log" append="false">
+            <PatternLayout pattern="[%d{HH:mm:ss.SSS}][%p] %X{workerName}{[Name-%X{workerName}]} %m%n%throwable" />
+        </File>
+    </Appenders>
+
+    <Loggers>
+        <Root level="TRACE">
+            <AppenderRef ref="Console" />
+            <AppenderRef ref="File" />
+        </Root>
+    </Loggers>
+</Configuration>

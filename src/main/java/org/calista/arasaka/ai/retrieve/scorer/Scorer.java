@@ -17,6 +17,16 @@ public interface Scorer {
     double score(String query, Statement st);
 
     /**
+     * Optional per-token weight used by retrievers for query refinement / analysis.
+     *
+     * Implementations with corpus statistics (e.g. DF/IDF) should override this.
+     * Default = 1.0 (no special weighting).
+     */
+    default double termWeight(String token) {
+        return 1.0;
+    }
+
+    /**
      * Optional warmup step for enterprise-grade performance.
      * Implementations may precompute statistics/caches over the corpus.
      */

@@ -30,6 +30,12 @@ public final class TokenOverlapScorer implements Scorer {
     }
 
     @Override
+    public double termWeight(String token) {
+        if (token == null || token.isBlank()) return 1.0;
+        return idf.getOrDefault(token.toLowerCase(Locale.ROOT), 1.0);
+    }
+
+    @Override
     public void prepare(Collection<Statement> corpus) {
         if (prepared) return;
         if (corpus == null || corpus.isEmpty()) {

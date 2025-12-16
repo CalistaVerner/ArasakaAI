@@ -4,40 +4,45 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.calista.arasaka.ai.knowledge.Statement;
 import org.calista.arasaka.ai.retrieve.retriver.Retriever;
-import org.calista.arasaka.ai.think.ResponseStrategy;
-import org.calista.arasaka.ai.think.TextGenerator;
-import org.calista.arasaka.ai.think.ThoughtResult;
-import org.calista.arasaka.ai.think.ThoughtState;
+import org.calista.arasaka.ai.think.*;
 import org.calista.arasaka.ai.think.candidate.Candidate;
 import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.think.engine.ThoughtCycleEngine;
 import org.calista.arasaka.ai.think.intent.Intent;
 import org.calista.arasaka.ai.think.intent.IntentDetector;
+import org.calista.arasaka.ai.think.textGenerator.TextGenerator;
 
+import java.text.Normalizer;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Predicate;
-import java.util.regex.MatchResult;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
  * Enterprise deterministic think-loop:
- * base retrieval -> context-driven refinement -> draft -> evaluate -> self-correct -> (optional) LTM writeback.
+ * base retrieval -> (optional) context refinement -> draft -> evaluate -> self-correct -> (optional) LTM.
  *
- * Rules:
- *  - NO domain semantic hardcode (identity/smalltalk are data in corpora)
- *  - NEVER feed telemetry/critique into retriever queries (prevents cache poisoning)
- *  - deterministic ordering, stable keys, dedup everywhere
+ * Enterprise rules:
+ *  - NEVER feed telemetry/critique/internal markers into retriever queries (prevents cache poisoning)
+ *  - NO domain semantic hardcode (identity/smalltalk lives in corpora)
+ *  - deterministic ordering and stable keys
  */
 public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
     private static final Logger log = LogManager.getLogger(IterativeThoughtEngine.class);
 
+    // tokenization for recall/overlap (>=3 keeps noise low; still configurable via code edits if needed)
     private static final java.util.regex.Pattern WORD = java.util.regex.Pattern.compile("[\\p{L}\\p{Nd}_]{3,}");
+
+    // telemetry signatures + internal markers (generic, non-domain)
     private static final java.util.regex.Pattern TELEMETRY = java.util.regex.Pattern.compile(
-            "(?i)(^\\s*(noctx;|err=|sec=)\\S*\\s*$)|(\\w+=\\S+;)|(\\bqc=)|(\\bg=)|(\\bnov=)|(\\brep=)|(\\bmd=)"
+            "(?i)" +
+                    "(^\\s*(noctx;|err=|sec=)\\S*\\s*$)|" +
+                    "(\\w+=\\S+;)|" +
+                    "(\\bqc=)|(\\bg=)|(\\bnov=)|(\\brep=)|(\\bmd=)|" +
+                    "(\\bno_context\\b)|(\\bnoctx\\b)|(\\bmore_evidence\\b)|(\\bfix\\b)|(\\bnotes\\b)"
     );
 
     private final Retriever retriever;
@@ -61,14 +66,17 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     private final ConcurrentMap<String, Statement> ltmByKey = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Double> ltmPriorityByKey = new ConcurrentHashMap<>();
 
-    // --- pipelines ---
+    // token cache for LTM statements (big speed-up for recallScore)
+    private final ConcurrentMap<String, Set<String>> ltmTokensByKey = new ConcurrentHashMap<>();
+
+    // refinement inside each iteration
+    private final int refineRounds;
+    private final int refineQueryBudget;
+
+    // pipelines
     private final List<QueryProvider> queryProviders;
     private final List<Predicate<String>> queryFilters;
     private final List<StopRule> stopRules;
-
-    // refinement inside each iteration
-    private final int refineRounds;       // usually 1–2
-    private final int refineQueryBudget;  // max derived queries per round
 
     public IterativeThoughtEngine(Retriever retriever,
                                   IntentDetector intentDetector,
@@ -79,10 +87,14 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                                   int retrieveK,
                                   int draftsPerIteration,
                                   int patience,
-                                  double targetScore) {
+                                  double targetScore,
+                                  boolean ltmEnabled,
+                                  int ltmCapacity,
+                                  int ltmRecallK,
+                                  double ltmWriteMinGroundedness) {
         this(retriever, intentDetector, strategy, evaluator, generator,
                 iterations, retrieveK, draftsPerIteration, patience, targetScore,
-                true, 50_000, 64, 0.55,
+                ltmEnabled, ltmCapacity, ltmRecallK, ltmWriteMinGroundedness,
                 1, 16);
     }
 
@@ -126,11 +138,11 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         this.queryProviders = List.of(
                 QueryProvider.userText(),
                 QueryProvider.intentName(),
-                QueryProvider.bestTerms(8, 5) // (maxTerms=8, minLen=5)
+                QueryProvider.bestTerms(10, 5) // hygienic terms from bestSoFar
         );
 
         this.queryFilters = List.of(
-                s -> s != null,
+                Objects::nonNull,
                 s -> !s.trim().isEmpty(),
                 s -> !TELEMETRY.matcher(s).find(),
                 s -> WORD.matcher(s.toLowerCase(Locale.ROOT)).find()
@@ -145,7 +157,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     @Override
     public ThoughtResult think(String userText, long seed) {
 
-        final String q0 = normalize(userText);
+        final String q0 = normalizeUserText(userText);
         final Intent intent = intentDetector.detect(q0);
 
         ThoughtState state = new ThoughtState();
@@ -153,29 +165,33 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         state.generator = generator;
         state.query = q0;
 
+        // IMPORTANT: protect against null tags in ThoughtState implementation
+        if (state.tags == null) state.tags = new HashMap<>(16);
+
         initResponseSchema(state, q0, intent);
 
         Candidate globalBest = new Candidate("", Double.NEGATIVE_INFINITY, "", null);
         state.bestSoFar = globalBest;
         state.bestEvaluation = null;
 
-        List<String> trace = new ArrayList<>(iterations * 2);
+        List<String> trace = new ArrayList<>(Math.max(4, iterations * 2));
         int stagnation = 0;
 
         for (int iter = 1; iter <= iterations; iter++) {
             state.iteration = iter;
             state.seed = mix(seed, iter);
 
-            // generator hint only (not used for retrieval)
+            // generator hint only (never used for retrieval)
             state.generationHint = buildGenerationHint(state);
 
-            // ---- Phase A: base queries ----
+            // ---- queries (no critique, no telemetry) ----
             List<String> baseQueries = buildQueries(q0, state);
 
-            // ---- Phase B: retrieve + context refinement ----
+            // ---- retrieve base ----
             Map<String, Statement> mergedByKey = new ConcurrentHashMap<>();
             retrieveAndMerge(baseQueries, mergedByKey, state.seed);
 
+            // ---- refine (data-driven) ----
             for (int r = 0; r < refineRounds; r++) {
                 List<Statement> ctxNow = toDeterministicContext(mergedByKey);
                 List<String> derived = deriveQueriesFromContext(ctxNow, refineQueryBudget);
@@ -188,13 +204,14 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             state.recalledMemory = recalled;
             mergeStatements(recalled, mergedByKey);
 
+            // ---- deterministic context ----
             List<Statement> context = toDeterministicContext(mergedByKey);
             state.lastContext = context;
 
-            // ---- Drafts ----
+            // ---- drafts ----
             List<String> drafts = Drafts.sanitize(generateDrafts(q0, context, state), draftsPerIteration);
 
-            // ---- Evaluate ----
+            // ---- evaluate ----
             List<Candidate> evaluated = drafts.parallelStream()
                     .map(text -> Candidate.fromEvaluation(text, evaluator.evaluate(q0, text, context)))
                     .toList();
@@ -216,6 +233,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             state.bestSoFar = globalBest;
             state.bestEvaluation = globalBest.evaluation;
 
+            // ---- LTM writeback (evidence-only) ----
             if (ltmEnabled && bestIter.evaluation != null && bestIter.evaluation.valid) {
                 maybeWritebackToLtm(bestIter, context);
             }
@@ -238,22 +256,17 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         return new ThoughtResult(globalBest.text, trace, intent, globalBest, globalBest.evaluation);
     }
 
-    // -------------------- Query pipeline (NO critique, NO telemetry) --------------------
+    // -------------------- queries --------------------
 
     private List<String> buildQueries(String userText, ThoughtState state) {
         return queryProviders.stream()
                 .flatMap(p -> p.provide(userText, state))
-                .map(IterativeThoughtEngine::normalize)
+                .map(IterativeThoughtEngine::normalizeQuery)
                 .filter(andAll(queryFilters))
                 .distinct()
                 .toList();
     }
 
-    /**
-     * Data-driven refinement:
-     * - from tags, ids, and text terms of already retrieved context
-     * - no semantic interpretation (identity etc. is DATA)
-     */
     private List<String> deriveQueriesFromContext(List<Statement> ctx, int budget) {
         if (ctx == null || ctx.isEmpty()) return List.of();
 
@@ -275,7 +288,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 .filter(t -> t != null && !t.isBlank());
 
         return Stream.concat(Stream.concat(tags, ids), terms)
-                .map(IterativeThoughtEngine::normalize)
+                .map(IterativeThoughtEngine::normalizeQuery)
                 .filter(andAll(queryFilters))
                 .distinct()
                 .limit(Math.max(1, budget))
@@ -286,14 +299,16 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         return preds.stream().reduce(x -> true, Predicate::and);
     }
 
-    // -------------------- Retrieval / merge --------------------
+    // -------------------- retrieval/merge --------------------
 
     private void retrieveAndMerge(List<String> queries, Map<String, Statement> mergedByKey, long seed) {
         if (queries == null || queries.isEmpty()) return;
-        queries.parallelStream().forEach(q -> {
-            List<Statement> stmts = retriever.retrieve(q, retrieveK, mix(seed, q.hashCode()));
-            mergeStatements(stmts, mergedByKey);
-        });
+
+        // parallel retrieval is fine; merge is concurrent; final context is deterministic via sorting by key
+        queries.parallelStream().forEach(q -> mergeStatements(
+                retriever.retrieve(q, retrieveK, mix(seed, q.hashCode())),
+                mergedByKey
+        ));
     }
 
     private static void mergeStatements(List<Statement> stmts, Map<String, Statement> mergedByKey) {
@@ -319,7 +334,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         catch (Exception ignored) { return false; }
     }
 
-    // -------------------- Drafts --------------------
+    // -------------------- drafts --------------------
 
     private List<String> generateDrafts(String userText, List<Statement> context, ThoughtState state) {
         if (generator != null) return generator.generateN(userText, context, state, draftsPerIteration);
@@ -349,7 +364,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         }
     }
 
-    // -------------------- Candidate selection --------------------
+    // -------------------- candidate selection --------------------
 
     private static Optional<Candidate> pickBest(List<Candidate> evaluated) {
         if (evaluated == null || evaluated.isEmpty()) return Optional.empty();
@@ -363,86 +378,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 : evaluated.stream().filter(Objects::nonNull).max(Comparator.comparingDouble(c -> c.score));
     }
 
-    // -------------------- LTM --------------------
-
-    private List<Statement> recallFromLtm(List<String> queries) {
-        if (ltmByKey.isEmpty() || ltmRecallK <= 0) return List.of();
-
-        Set<String> qTokens = queries.stream()
-                .flatMap(q -> tokens(q).stream())
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-
-        var all = new ArrayList<>(ltmByKey.entrySet());
-        all.sort((a, b) -> {
-            double sa = recallScore(a.getKey(), a.getValue(), qTokens);
-            double sb = recallScore(b.getKey(), b.getValue(), qTokens);
-            int cmp = Double.compare(sb, sa);
-            return (cmp != 0) ? cmp : a.getKey().compareTo(b.getKey());
-        });
-
-        int k = Math.min(ltmRecallK, all.size());
-        ArrayList<Statement> out = new ArrayList<>(k);
-        for (int i = 0; i < k; i++) out.add(all.get(i).getValue());
-        return out;
-    }
-
-    private double recallScore(String key, Statement st, Set<String> qTokens) {
-        Set<String> sTok = tokens(st == null ? "" : st.text);
-        int ov = overlap(sTok, qTokens);
-        double pri = ltmPriorityByKey.getOrDefault(key, 0.0);
-        double w = st == null ? 1.0 : Math.max(0.1, st.weight);
-        return (ov * w) + (pri * 0.10);
-    }
-
-    private void maybeWritebackToLtm(Candidate best, List<Statement> context) {
-        CandidateEvaluator.Evaluation ev = best.evaluation;
-        if (ev == null || !ev.valid || ev.groundedness < ltmWriteMinGroundedness) return;
-
-        List<Statement> topEvidence = topSupportingEvidence(best.text, context, 8);
-        for (Statement s : topEvidence) {
-            if (s == null || !isValidStatement(s)) continue;
-            String key = stableStmtKey(s);
-            if (key == null) continue;
-
-            ltmByKey.putIfAbsent(key, s);
-            ltmPriorityByKey.merge(key, 1.0, Double::sum);
-        }
-
-        int overflow = (ltmCapacity > 0) ? (ltmByKey.size() - ltmCapacity) : 0;
-        if (overflow > 0) evictLtm(overflow);
-    }
-
-    private void evictLtm(int need) {
-        if (need <= 0) return;
-
-        ArrayList<String> keys = new ArrayList<>(ltmByKey.keySet());
-        keys.sort((a, b) -> {
-            double pa = ltmPriorityByKey.getOrDefault(a, 0.0);
-            double pb = ltmPriorityByKey.getOrDefault(b, 0.0);
-            int cmp = Double.compare(pa, pb);
-            return (cmp != 0) ? cmp : a.compareTo(b);
-        });
-
-        for (int i = 0; i < Math.min(need, keys.size()); i++) {
-            String key = keys.get(i);
-            ltmByKey.remove(key);
-            ltmPriorityByKey.remove(key);
-        }
-    }
-
-    private List<Statement> topSupportingEvidence(String answer, List<Statement> ctx, int k) {
-        if (ctx == null || ctx.isEmpty()) return List.of();
-        Set<String> aTok = tokens(answer);
-
-        return ctx.stream()
-                .filter(Objects::nonNull)
-                .sorted(Comparator.comparingInt((Statement s) -> overlap(tokens(s.text), aTok)).reversed()
-                        .thenComparing(s -> normalize(s.text)))
-                .limit(Math.max(0, k))
-                .toList();
-    }
-
-    // -------------------- Generator hint (NOT retrieval) --------------------
+    // -------------------- generator hint --------------------
 
     private static String buildGenerationHint(ThoughtState state) {
         String sections = Optional.ofNullable(state)
@@ -477,13 +413,22 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
         Optional.ofNullable(state.lastCritique)
                 .filter(v -> !v.isBlank())
-                .ifPresent(v -> sb.append(";last_notes=").append(v.replace('\n', ' ')));
+                .ifPresent(v -> sb.append(";last_notes=").append(sanitizeHint(v)));
 
         return sb.toString();
     }
 
+    private static String sanitizeHint(String v) {
+        // do NOT leak newlines / control chars to generator side; keep it compact
+        String s = v.replace('\n', ' ').replace('\r', ' ').trim();
+        // hard cap to avoid prompt bloat
+        if (s.length() > 240) s = s.substring(0, 239) + "…";
+        return s;
+    }
+
     private static void initResponseSchema(ThoughtState state, String userText, Intent intent) {
-        if (state == null || state.tags == null) return;
+        if (state == null) return;
+        if (state.tags == null) state.tags = new HashMap<>(16);
 
         boolean ru = isMostlyCyrillic(userText);
 
@@ -493,27 +438,124 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         state.tags.putIfAbsent("response.label.evidence", ru ? "Опора на контекст" : "Evidence from context");
         state.tags.putIfAbsent("response.label.actions", ru ? "Следующие шаги" : "Next steps");
 
-        // minimal format contraction only
-        Optional.ofNullable(intent)
-                .filter(i -> i == Intent.GREETING)
-                .ifPresent(i -> {
-                    state.tags.put("response.style", "plain");
-                    state.tags.put("response.sections", "summary");
-                });
+        // IMPORTANT: no intent-specific schema hardcode.
+        // If you want to change formatting based on intent, do it data-driven:
+        // put desired keys into state.tags BEFORE generation (e.g. via corpora/LTM/config).
+        // This engine stays neutral: one pipeline, one schema contract.
     }
 
-    // -------------------- Utilities --------------------
+    // -------------------- LTM --------------------
 
-    private static String normalize(String s) {
-        return s == null ? "" : s.trim();
+    private List<Statement> recallFromLtm(List<String> queries) {
+        if (ltmByKey.isEmpty() || ltmRecallK <= 0) return List.of();
+
+        Set<String> qTokens = queries.stream()
+                .flatMap(q -> tokens(q).stream())
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        var all = new ArrayList<>(ltmByKey.entrySet());
+        all.sort((a, b) -> {
+            double sa = recallScore(a.getKey(), a.getValue(), qTokens);
+            double sb = recallScore(b.getKey(), b.getValue(), qTokens);
+            int cmp = Double.compare(sb, sa);
+            return (cmp != 0) ? cmp : a.getKey().compareTo(b.getKey());
+        });
+
+        int k = Math.min(ltmRecallK, all.size());
+        ArrayList<Statement> out = new ArrayList<>(k);
+        for (int i = 0; i < k; i++) out.add(all.get(i).getValue());
+        return out;
     }
 
-    private static long mix(long a, long b) {
-        long x = a ^ b;
-        x ^= (x >>> 33);
-        x *= 0xff51afd7ed558ccdL;
-        x ^= (x >>> 33);
+    private double recallScore(String key, Statement st, Set<String> qTokens) {
+        Set<String> sTok = ltmTokensByKey.computeIfAbsent(key, kk -> tokens(st == null ? "" : st.text));
+        int ov = overlap(sTok, qTokens);
+        double pri = ltmPriorityByKey.getOrDefault(key, 0.0);
+        double w = st == null ? 1.0 : Math.max(0.1, st.weight);
+        return (ov * w) + (pri * 0.10);
+    }
+
+    private void maybeWritebackToLtm(Candidate best, List<Statement> context) {
+        CandidateEvaluator.Evaluation ev = best.evaluation;
+        if (ev == null || !ev.valid) return;
+        if (ev.groundedness < ltmWriteMinGroundedness) return;
+
+        List<Statement> topEvidence = topSupportingEvidence(best.text, context, 8);
+        for (Statement s : topEvidence) {
+            if (s == null || !isValidStatement(s)) continue;
+            String key = stableStmtKey(s);
+            if (key == null) continue;
+
+            ltmByKey.putIfAbsent(key, s);
+            ltmPriorityByKey.merge(key, 1.0, Double::sum);
+            ltmTokensByKey.putIfAbsent(key, tokens(s.text));
+        }
+
+        int overflow = (ltmCapacity > 0) ? (ltmByKey.size() - ltmCapacity) : 0;
+        if (overflow > 0) evictLtm(overflow);
+    }
+
+    private void evictLtm(int need) {
+        if (need <= 0) return;
+
+        ArrayList<String> keys = new ArrayList<>(ltmByKey.keySet());
+        keys.sort((a, b) -> {
+            double pa = ltmPriorityByKey.getOrDefault(a, 0.0);
+            double pb = ltmPriorityByKey.getOrDefault(b, 0.0);
+            int cmp = Double.compare(pa, pb);
+            return (cmp != 0) ? cmp : a.compareTo(b);
+        });
+
+        for (int i = 0; i < Math.min(need, keys.size()); i++) {
+            String key = keys.get(i);
+            ltmByKey.remove(key);
+            ltmPriorityByKey.remove(key);
+            ltmTokensByKey.remove(key);
+        }
+    }
+
+    private List<Statement> topSupportingEvidence(String answer, List<Statement> ctx, int k) {
+        if (ctx == null || ctx.isEmpty()) return List.of();
+        Set<String> aTok = tokens(answer);
+
+        return ctx.stream()
+                .filter(Objects::nonNull)
+                .sorted(Comparator
+                        .comparingInt((Statement s) -> overlap(tokens(s.text), aTok)).reversed()
+                        .thenComparing(s -> normalizeQuery(s.text)))
+                .limit(Math.max(0, k))
+                .toList();
+    }
+
+    // -------------------- utilities --------------------
+
+    private static String normalizeUserText(String s) {
+        if (s == null) return "";
+        String x = s.trim();
+        if (x.isEmpty()) return "";
+        // stable unicode normalization + collapse whitespace
+        x = Normalizer.normalize(x, Normalizer.Form.NFKC);
+        x = x.replace('\u00A0', ' ');
+        x = x.replaceAll("\\s+", " ").trim();
         return x;
+    }
+
+    private static String normalizeQuery(String s) {
+        if (s == null) return "";
+        String x = s.trim();
+        if (x.isEmpty()) return "";
+        x = Normalizer.normalize(x, Normalizer.Form.NFKC);
+        x = x.replace('\u00A0', ' ');
+        x = x.replaceAll("\\s+", " ").trim();
+        return x;
+    }
+
+    // SplitMix64 — быстрый, стабильный, хороший для сидов/подсидов
+    private static long mix(long seed, long salt) {
+        long z = seed + 0x9E3779B97F4A7C15L + salt;
+        z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
+        z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
+        return z ^ (z >>> 31);
     }
 
     private static String fmt(double v) {
@@ -531,7 +573,11 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         for (int i = 0; i < s.length(); i++) {
             char ch = s.charAt(i);
             if (Character.isWhitespace(ch)) continue;
-            if (ch >= 'А' && ch <= 'я') cyr++;
+            Character.UnicodeBlock b = Character.UnicodeBlock.of(ch);
+            if (b == Character.UnicodeBlock.CYRILLIC
+                    || b == Character.UnicodeBlock.CYRILLIC_SUPPLEMENTARY
+                    || b == Character.UnicodeBlock.CYRILLIC_EXTENDED_A
+                    || b == Character.UnicodeBlock.CYRILLIC_EXTENDED_B) cyr++;
             else other++;
         }
         return cyr > other;
@@ -541,7 +587,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         if (s == null || s.isBlank()) return Set.of();
         return WORD.matcher(s.toLowerCase(Locale.ROOT))
                 .results()
-                .map(MatchResult::group)
+                .map(r -> r.group())
                 .limit(256)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
     }
@@ -557,10 +603,13 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         if (s == null) return null;
         if (s.id != null && !s.id.isBlank()) return "id:" + s.id.trim();
         if (s.text == null || s.text.isBlank()) return null;
-        return "tx:" + s.text.trim();
+
+        // normalized text key reduces accidental duplicates from whitespace variants
+        String tx = normalizeQuery(s.text);
+        return tx.isBlank() ? null : "tx:" + tx;
     }
 
-    // -------------------- Enterprise primitives --------------------
+    // -------------------- enterprise primitives --------------------
 
     private interface QueryProvider {
         Stream<String> provide(String userText, ThoughtState state);
@@ -576,20 +625,20 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                     .map(Intent::name);
         }
 
+        /**
+         * IMPORTANT: bestTerms must be hygienic to avoid pulling "no_context"/"fix=..." from bestSoFar text.
+         */
         static QueryProvider bestTerms(int maxTerms, int minLen) {
             int mt = Math.max(1, maxTerms);
             int ml = Math.max(2, minLen);
-
             return (u, s) -> Stream.ofNullable(s)
                     .map(st -> st.bestSoFar)
                     .map(c -> c == null ? "" : c.text)
-                    .map(IterativeThoughtEngine::normalize)
+                    .map(IterativeThoughtEngine::normalizeQuery)
                     .filter(v -> !v.isEmpty())
                     .map(v -> TermExtractor.uniqueTerms(v, mt, ml))
-                    .filter(v -> !v.isBlank())
-                    .map(Stream::of)
-                    .findFirst()
-                    .orElseGet(Stream::empty);
+                    .filter(v -> v != null && !v.isBlank())
+                    .flatMap(v -> Stream.of(v));
         }
     }
 
@@ -612,14 +661,17 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         static String uniqueTerms(String text, int maxTerms, int minLen) {
             if (text == null || text.isBlank()) return "";
             LinkedHashSet<String> uniq = new LinkedHashSet<>();
-            for (String raw : text.split("\\W+")) {
+
+            // split by non-letter/digit/_ (same spirit as WORD, но быстрее чем regex matcher на каждый токен)
+            for (String raw : text.split("[^\\p{L}\\p{Nd}_]+")) {
                 if (raw == null) continue;
                 String t = raw.trim().toLowerCase(Locale.ROOT);
                 if (t.length() < minLen) continue;
-                if (TELEMETRY.matcher(t).find()) continue;
+                if (TELEMETRY.matcher(t).find()) continue; // blocks no_context/noctx/more_evidence/fix/notes etc.
                 uniq.add(t);
                 if (uniq.size() >= maxTerms) break;
             }
+
             return String.join(" ", uniq);
         }
     }

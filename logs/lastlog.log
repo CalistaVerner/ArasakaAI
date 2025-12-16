@@ -1,0 +1,15 @@
+[21:15:05.847][INFO]  FileIO init: baseDir=C:\Users\Aiden\Documents\GitHub\ArasakaAI, charset=UTF-8, atomicWrites=true, fsyncOnCommit=true, lockWrites=false, lockTimeout=PT3S, ioBufferSize=65536
+[21:15:05.849][DEBUG]  Base dir ensured: C:\Users\Aiden\Documents\GitHub\ArasakaAI
+[21:15:05.905][INFO]  FileIO init: baseDir=C:\Users\Aiden\Documents\GitHub\ArasakaAI\data, charset=UTF-8, atomicWrites=true, fsyncOnCommit=true, lockWrites=false, lockTimeout=PT3S, ioBufferSize=65536
+[21:15:05.906][DEBUG]  Base dir ensured: C:\Users\Aiden\Documents\GitHub\ArasakaAI\data
+[21:15:05.906][DEBUG]  Base dir ensured: C:\Users\Aiden\Documents\GitHub\ArasakaAI\data
+[21:15:05.909][DEBUG]  readJsonl: C:\Users\Aiden\Documents\GitHub\ArasakaAI\corpora\arasaka.core.jsonl (11 records)
+[21:15:05.911][INFO]  Corpus loaded: C:\Users\Aiden\Documents\GitHub\ArasakaAI\corpora\arasaka.core.jsonl (ok=11, bad=0)
+[21:15:05.912][DEBUG]  readJsonl: C:\Users\Aiden\Documents\GitHub\ArasakaAI\corpora\arasaka.values.jsonl (12 records)
+[21:15:05.913][INFO]  Corpus loaded: C:\Users\Aiden\Documents\GitHub\ArasakaAI\corpora\arasaka.values.jsonl (ok=12, bad=0)
+[21:15:05.913][WARN]  Corpus not found: C:\Users\Aiden\Documents\GitHub\ArasakaAI\corpora\arasaka.constraits.jsonl
+[21:15:05.914][DEBUG]  readJsonl: C:\Users\Aiden\Documents\GitHub\ArasakaAI\corpora\domain\java.jsonl (2 records)
+[21:15:05.914][INFO]  Corpus loaded: C:\Users\Aiden\Documents\GitHub\ArasakaAI\corpora\domain\java.jsonl (ok=2, bad=0)
+[21:15:06.961][INFO]  AI started. knowledge.size=25
+[21:15:06.961][INFO]  Type 'exit' to quit.
+

@@ -4,6 +4,7 @@ import org.calista.arasaka.ai.knowledge.Statement;
 import org.calista.arasaka.ai.think.candidate.Candidate;
 import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.think.intent.Intent;
+import org.calista.arasaka.ai.think.textGenerator.TextGenerator;
 
 import java.util.HashMap;
 import java.util.List;

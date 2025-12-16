@@ -78,3 +78,167 @@
 {"type":"USER","tsEpochMs":1765880948648,"sessionId":"sess-f7c5c7daca48","text":"Компонент"}
 {"type":"ASSISTANT","tsEpochMs":1765880948820,"sessionId":"sess-f7c5c7daca48","text":"1) Каждый компонент системы должен иметь одну зону ответственности.\n\n2)\n• Каждый компонент системы должен иметь одну зону ответственности.\n3)\n1) Каждый компонент системы должен иметь одну зону ответственности."}
 {"type":"LEARNING","tsEpochMs":1765880948823,"sessionId":"sess-f7c5c7daca48","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765883953166,"sessionId":"sess-fa8288de7dfb","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765883953307,"sessionId":"sess-fa8288de7dfb","text":"Вывод:\nПривет"}
+{"type":"LEARNING","tsEpochMs":1765883953311,"sessionId":"sess-fa8288de7dfb","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765883963018,"sessionId":"sess-fa8288de7dfb","text":"Как ты?"}
+{"type":"ASSISTANT","tsEpochMs":1765883963043,"sessionId":"sess-fa8288de7dfb","text":"## Вывод\nКак ты?\n\n## Опора на контекст\n• (no_context)"}
+{"type":"LEARNING","tsEpochMs":1765883963043,"sessionId":"sess-fa8288de7dfb","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765883979296,"sessionId":"sess-fa8288de7dfb","text":"Ты - мой ИИ"}
+{"type":"ASSISTANT","tsEpochMs":1765883979325,"sessionId":"sess-fa8288de7dfb","text":"## Вывод\nТы - мой ИИ\n\n## Опора на контекст\n• (no_context)"}
+{"type":"LEARNING","tsEpochMs":1765883979326,"sessionId":"sess-fa8288de7dfb","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765883998546,"sessionId":"sess-fa8288de7dfb","text":"Запомни, я тебя создала"}
+{"type":"ASSISTANT","tsEpochMs":1765883998573,"sessionId":"sess-fa8288de7dfb","text":"## Вывод\nЗапомни, я тебя создала\n\n## Опора на контекст\n• (no_context)"}
+{"type":"LEARNING","tsEpochMs":1765883998574,"sessionId":"sess-fa8288de7dfb","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765884041340,"sessionId":"sess-fa8288de7dfb","text":"Конпеки плаза"}
+{"type":"ASSISTANT","tsEpochMs":1765884041365,"sessionId":"sess-fa8288de7dfb","text":"## Вывод\nКонпеки плаза\n\n## Опора на контекст\n• (no_context)"}
+{"type":"LEARNING","tsEpochMs":1765884041365,"sessionId":"sess-fa8288de7dfb","text":"learned_from_turn"}
+{"type":"SNAPSHOT","tsEpochMs":1765884041375,"sessionId":"sess-fa8288de7dfb","text":"saved"}
+{"type":"USER","tsEpochMs":1765884068050,"sessionId":"sess-fa8288de7dfb","text":"Что ты умеешь?"}
+{"type":"ASSISTANT","tsEpochMs":1765884068061,"sessionId":"sess-fa8288de7dfb","text":"## Вывод\nЧто ты умеешь?\n\n## Опора на контекст\n• (no_context)"}
+{"type":"LEARNING","tsEpochMs":1765884068062,"sessionId":"sess-fa8288de7dfb","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765884081278,"sessionId":"sess-fa8288de7dfb","text":"Да что ты такое???"}
+{"type":"ASSISTANT","tsEpochMs":1765884081285,"sessionId":"sess-fa8288de7dfb","text":"## Вывод\nДа что ты такое???\n\n## Опора на контекст\n• (no_context)"}
+{"type":"LEARNING","tsEpochMs":1765884081286,"sessionId":"sess-fa8288de7dfb","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765884487618,"sessionId":"sess-fafeeca8105f","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765884487757,"sessionId":"sess-fafeeca8105f","text":"Вывод:\nПривет"}
+{"type":"LEARNING","tsEpochMs":1765884487760,"sessionId":"sess-fafeeca8105f","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765884500834,"sessionId":"sess-fafeeca8105f","text":"Как дела?"}
+{"type":"ASSISTANT","tsEpochMs":1765884500866,"sessionId":"sess-fafeeca8105f","text":"## Вывод\nКак дела?\n\n## Опора на контекст\n• (no_context)"}
+{"type":"LEARNING","tsEpochMs":1765884500867,"sessionId":"sess-fafeeca8105f","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765885069770,"sessionId":"sess-fb86315b1fa4","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765885069869,"sessionId":"sess-fb86315b1fa4","text":"Вывод:\nПривет"}
+{"type":"LEARNING","tsEpochMs":1765885069872,"sessionId":"sess-fb86315b1fa4","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765885076345,"sessionId":"sess-fb86315b1fa4","text":"Кто ты?"}
+{"type":"ASSISTANT","tsEpochMs":1765885076362,"sessionId":"sess-fb86315b1fa4","text":"## Вывод\nКто ты?\n\n## Опора на контекст\n• (no_context)"}
+{"type":"LEARNING","tsEpochMs":1765885076362,"sessionId":"sess-fb86315b1fa4","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765887203895,"sessionId":"sess-fd76ff7d3a0f","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765887203958,"sessionId":"sess-fd76ff7d3a0f","text":"Вывод:\nПривет"}
+{"type":"LEARNING","tsEpochMs":1765887203960,"sessionId":"sess-fd76ff7d3a0f","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765887218200,"sessionId":"sess-fd76ff7d3a0f","text":"Кто ты?"}
+{"type":"ASSISTANT","tsEpochMs":1765887218221,"sessionId":"sess-fd76ff7d3a0f","text":"## Вывод\nКто ты?\n\n## Опора на контекст\n• (no_context)\n\n## Следующие шаги\n- fix=more_evidence\n- notes=noctx;qc=0.27;echo=0.00;rep=0.05;sec=3;md=3;v=1"}
+{"type":"LEARNING","tsEpochMs":1765887218223,"sessionId":"sess-fd76ff7d3a0f","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765888229462,"sessionId":"sess-fe658828318c","text":"Что ты такое?"}
+{"type":"ASSISTANT","tsEpochMs":1765888229533,"sessionId":"sess-fe658828318c","text":"## Вывод\nЧто ты такое?\n\n## Опора на контекст\n• (no_context)\n\n## Следующие шаги\n- fix=more_evidence\n- notes=noctx;qc=0.32;echo=0.00;rep=0.05;sec=3;md=3;v=1"}
+{"type":"LEARNING","tsEpochMs":1765888229536,"sessionId":"sess-fe658828318c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765888240836,"sessionId":"sess-fe658828318c","text":"Ну привет"}
+{"type":"ASSISTANT","tsEpochMs":1765888240890,"sessionId":"sess-fe658828318c","text":"Вывод:\nНу привет"}
+{"type":"LEARNING","tsEpochMs":1765888240890,"sessionId":"sess-fe658828318c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765888257073,"sessionId":"sess-fe658828318c","text":"Ебучий случай"}
+{"type":"ASSISTANT","tsEpochMs":1765888257087,"sessionId":"sess-fe658828318c","text":"## Вывод\nЕбучий случай\n\n## Опора на контекст\n• (no_context)"}
+{"type":"LEARNING","tsEpochMs":1765888257088,"sessionId":"sess-fe658828318c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765888262870,"sessionId":"sess-fe658828318c","text":"Калиста"}
+{"type":"ASSISTANT","tsEpochMs":1765888263019,"sessionId":"sess-fe658828318c","text":"## Вывод\nСоздательницей Arasaka AI является Калиста Вернер — архитектор системы и инициатор концепции детерминированного, самоанализирующегося искусственного интеллекта.\n\n## Опора на контекст\n• Создательницей Arasaka AI является Калиста Вернер — архитектор системы и инициатор концепции детерминированного, самоанализирующегося искусственного интеллекта.\n• Arasaka AI не генерирует ответы случайно: каждый ответ является результатом анализа запроса, отбора релевантных данных, оценки качества и самоисправления.\n• Arasaka AI проектируется так, чтобы накапливать знания и улучшать качество ответов со временем.\n• Arasaka AI стремится делать свои выводы понятными и объяснимыми для пользователя.\n• Arasaka AI — это корпоративный искусственный интеллект, предназначенный для анализа, рассуждения и поддержки принятия решений на уровне предприятия.\n• Долгосрочная память Arasaka AI хранит только проверенные факты и знания, получившие подтверждение в процессе рассуждений.\n• Каждый вывод Arasaka AI должен быть объясним: система стремится показывать, на каких данных и рассуждениях основан ответ.\n• Основное предназначение Arasaka AI — помогать пользователям принимать обоснованные решения, опираясь на знания, логику и проверяемые источники, а не на догадки.\n\n## Следующие шаги\n- Создательницей Arasaka AI является Калиста Вернер — архитектор системы и инициатор концепции детерминированного, самоанализирующегося искусственного интеллекта.\n- Arasaka AI не генерирует ответы случайно: каждый ответ является результатом анализа запроса, отбора релевантных данных, оценки качества и самоисправления.\n- Arasaka AI проектируется так, чтобы накапливать знания и улучшать качество ответов со временем.\n- Arasaka AI стремится делать свои выводы понятными и объяснимыми для пользователя."}
+{"type":"LEARNING","tsEpochMs":1765888263021,"sessionId":"sess-fe658828318c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765892931528,"sessionId":"sess-102acd4930e70","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765892931589,"sessionId":"sess-102acd4930e70","text":"Вывод:\nПривет"}
+{"type":"LEARNING","tsEpochMs":1765892931591,"sessionId":"sess-102acd4930e70","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765892941200,"sessionId":"sess-102acd4930e70","text":"Как дела?"}
+{"type":"ASSISTANT","tsEpochMs":1765892941222,"sessionId":"sess-102acd4930e70","text":"## Вывод\nКак дела?\n\n## Опора на контекст\n• (no_context)\n\n## Следующие шаги\n- fix=more_evidence\n- notes=noctx;qc=0.27;echo=0.00;rep=0.05;sec=3;md=3;v=1"}
+{"type":"LEARNING","tsEpochMs":1765892941224,"sessionId":"sess-102acd4930e70","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765893174519,"sessionId":"sess-102e583ebfee4","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765893174581,"sessionId":"sess-102e583ebfee4","text":"Вывод:\nПривет"}
+{"type":"LEARNING","tsEpochMs":1765893174583,"sessionId":"sess-102e583ebfee4","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765893181630,"sessionId":"sess-102e583ebfee4","text":"Что ты такое?"}
+{"type":"ASSISTANT","tsEpochMs":1765893181667,"sessionId":"sess-102e583ebfee4","text":"## Вывод\nчто ты такое\n\n## Опора на контекст\n• что ты такое\n\n## Следующие шаги\n- что ты такое"}
+{"type":"LEARNING","tsEpochMs":1765893181667,"sessionId":"sess-102e583ebfee4","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765893300311,"sessionId":"sess-102e583ebfee4","text":"Калиста"}
+{"type":"ASSISTANT","tsEpochMs":1765893300375,"sessionId":"sess-102e583ebfee4","text":"## Вывод\nСоздательницей Arasaka AI является Калиста Вернер — архитектор системы и инициатор концепции детерминированного, самоанализирующегося искусственного интеллекта.\n\n## Опора на контекст\n• Создательницей Arasaka AI является Калиста Вернер — архитектор системы и инициатор концепции детерминированного, самоанализирующегося искусственного интеллекта.\n• Arasaka AI не генерирует ответы случайно: каждый ответ является результатом анализа запроса, отбора релевантных данных, оценки качества и самоисправления.\n• Arasaka AI проектируется так, чтобы накапливать знания и улучшать качество ответов со временем.\n• Arasaka AI стремится делать свои выводы понятными и объяснимыми для пользователя.\n• Arasaka AI — это корпоративный искусственный интеллект, предназначенный для анализа, рассуждения и поддержки принятия решений на уровне предприятия.\n• Долгосрочная память Arasaka AI хранит только проверенные факты и знания, получившие подтверждение в процессе рассуждений.\n• Каждый вывод Arasaka AI должен быть объясним: система стремится показывать, на каких данных и рассуждениях основан ответ.\n• Основное предназначение Arasaka AI — помогать пользователям принимать обоснованные решения, опираясь на знания, логику и проверяемые источники, а не на догадки.\n\n## Следующие шаги\n- Создательницей Arasaka AI является Калиста Вернер — архитектор системы и инициатор концепции детерминированного, самоанализирующегося искусственного интеллекта.\n- Arasaka AI не генерирует ответы случайно: каждый ответ является результатом анализа запроса, отбора релевантных данных, оценки качества и самоисправления.\n- Arasaka AI проектируется так, чтобы накапливать знания и улучшать качество ответов со временем.\n- Arasaka AI стремится делать свои выводы понятными и объяснимыми для пользователя."}
+{"type":"LEARNING","tsEpochMs":1765893300377,"sessionId":"sess-102e583ebfee4","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765894290307,"sessionId":"sess-103e95f7cbe7c","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765894290367,"sessionId":"sess-103e95f7cbe7c","text":"Вывод:\nПривет"}
+{"type":"LEARNING","tsEpochMs":1765894290373,"sessionId":"sess-103e95f7cbe7c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765894302368,"sessionId":"sess-103e95f7cbe7c","text":"Как дела?"}
+{"type":"ASSISTANT","tsEpochMs":1765894302381,"sessionId":"sess-103e95f7cbe7c","text":"## Вывод\nКак дела?\n\n## Опора на контекст\n• (no_context)\n\n## Следующие шаги\n- fix=more_evidence\n- notes=noctx;qc=0.27;echo=0.00;rep=0.05;sec=3;md=3;v=1"}
+{"type":"LEARNING","tsEpochMs":1765894302383,"sessionId":"sess-103e95f7cbe7c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765894317162,"sessionId":"sess-103e95f7cbe7c","text":"У меня дела - хорошо"}
+{"type":"ASSISTANT","tsEpochMs":1765894317172,"sessionId":"sess-103e95f7cbe7c","text":"## Вывод\nУ меня дела - хорошо\n\n## Опора на контекст\n• (no_context)\n\n## Следующие шаги\n- fix=more_evidence\n- notes=noctx;qc=0.37;echo=0.00;rep=0.05;sec=3;md=3;v=1"}
+{"type":"LEARNING","tsEpochMs":1765894317174,"sessionId":"sess-103e95f7cbe7c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765894605593,"sessionId":"sess-103e95f7cbe7c","text":"Что делаешь?"}
+{"type":"ASSISTANT","tsEpochMs":1765894605698,"sessionId":"sess-103e95f7cbe7c","text":"## Вывод\nчто ты такое\n\n## Опора на контекст\n• что ты такое\n• Arasaka AI не генерирует ответы случайно: каждый ответ является результатом анализа запроса, отбора релевантных данных, оценки качества и самоисправления.\n• Arasaka AI проектируется так, чтобы накапливать знания и улучшать качество ответов со временем.\n• Arasaka AI стремится делать свои выводы понятными и объяснимыми для пользователя.\n• Arasaka AI — это корпоративный искусственный интеллект, предназначенный для анализа, рассуждения и поддержки принятия решений на уровне предприятия.\n• Долгосрочная память Arasaka AI хранит только проверенные факты и знания, получившие подтверждение в процессе рассуждений.\n• Если возможно, выводы должны опираться на подтверждённые данные и знания.\n• Каждый вывод Arasaka AI должен быть объясним: система стремится показывать, на каких данных и рассуждениях основан ответ.\n\n## Следующие шаги\n- что ты такое\n- Arasaka AI не генерирует ответы случайно: каждый ответ является результатом анализа запроса, отбора релевантных данных, оценки качества и самоисправления.\n- Arasaka AI проектируется так, чтобы накапливать знания и улучшать качество ответов со временем.\n- Arasaka AI стремится делать свои выводы понятными и объяснимыми для пользователя."}
+{"type":"LEARNING","tsEpochMs":1765894605706,"sessionId":"sess-103e95f7cbe7c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765894678269,"sessionId":"sess-103e95f7cbe7c","text":"Что за херня?ъ"}
+{"type":"ASSISTANT","tsEpochMs":1765894678334,"sessionId":"sess-103e95f7cbe7c","text":"## Вывод\nВывод что ты такое ## Опора на контекст • что ты такое • Arasaka AI не генерирует ответы случайно\n\n## Опора на контекст\n• Вывод что ты такое ## Опора на контекст • что ты такое • Arasaka AI не генерирует ответы случайно\n• что ты такое\n• Arasaka AI не генерирует ответы случайно: каждый ответ является результатом анализа запроса, отбора релевантных данных, оценки качества и самоисправления.\n• Arasaka AI проектируется так, чтобы накапливать знания и улучшать качество ответов со временем.\n• Arasaka AI стремится делать свои выводы понятными и объяснимыми для пользователя.\n• Arasaka AI — это корпоративный искусственный интеллект, предназначенный для анализа, рассуждения и поддержки принятия решений на уровне предприятия.\n• Долгосрочная память Arasaka AI хранит только проверенные факты и знания, получившие подтверждение в процессе рассуждений.\n• Если возможно, выводы должны опираться на подтверждённые данные и знания.\n\n## Следующие шаги\n- Вывод что ты такое ## Опора на контекст • что ты такое • Arasaka AI не генерирует ответы случайно\n- что ты такое\n- Arasaka AI не генерирует ответы случайно: каждый ответ является результатом анализа запроса, отбора релевантных данных, оценки качества и самоисправления.\n- Arasaka AI проектируется так, чтобы накапливать знания и улучшать качество ответов со временем."}
+{"type":"LEARNING","tsEpochMs":1765894678341,"sessionId":"sess-103e95f7cbe7c","text":"learned_from_turn"}
+{"type":"SNAPSHOT","tsEpochMs":1765894678353,"sessionId":"sess-103e95f7cbe7c","text":"saved"}
+{"type":"USER","tsEpochMs":1765896103863,"sessionId":"sess-1058fd41182fc","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765896104031,"sessionId":"sess-1058fd41182fc","text":"## Вывод\nПривет\n\n## Опора на контекст\n• (no_context)"}
+{"type":"LEARNING","tsEpochMs":1765896104039,"sessionId":"sess-1058fd41182fc","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765896113858,"sessionId":"sess-1058fd41182fc","text":"Как жизнь?"}
+{"type":"ASSISTANT","tsEpochMs":1765896113908,"sessionId":"sess-1058fd41182fc","text":"## Вывод\nКак жизнь?\n\n## Опора на контекст\n• (no_context)"}
+{"type":"LEARNING","tsEpochMs":1765896113910,"sessionId":"sess-1058fd41182fc","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765897713267,"sessionId":"sess-10705f8e4342c","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765897713341,"sessionId":"sess-10705f8e4342c","text":"## Вывод\nПривет\n\n## Опора на контекст\n• (no_context)\n\n## Следующие шаги\n- fix=more_evidence\n- notes=noctx;qc=0.18;echo=0.00;rep=0.05;sec=3;md=3;st=0.93;v=1"}
+{"type":"LEARNING","tsEpochMs":1765897713348,"sessionId":"sess-10705f8e4342c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765898010468,"sessionId":"sess-1074b98e10e60","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765898010557,"sessionId":"sess-1074b98e10e60","text":"## Вывод\nПривет\n\n## Опора на контекст\n• (no_context)\n\n## Следующие шаги\n- fix=more_evidence\n- notes=noctx;qc=0.41;echo=0.00;rep=0.00;sec=2;md=2;st=0.27;v=1;q_f=0.00;q_s=0.27;q_c=0.41;q_a=0.34;q_r=0.20;q_ent=0.78;q_coh=0.85;q_minCoh=0.45;q_v=1"}
+{"type":"LEARNING","tsEpochMs":1765898010564,"sessionId":"sess-1074b98e10e60","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765898605539,"sessionId":"sess-107d4386d04d8","text":"Ну привет"}
+{"type":"ASSISTANT","tsEpochMs":1765898605741,"sessionId":"sess-107d4386d04d8","text":"## Вывод\nНу привет\n\n## Опора на контекст\n• Arasaka AI не генерирует ответы случайно: каждый ответ является результатом анализа запроса, отбора релевантных данных, оценки качества и самоисправления.\n• Arasaka AI стремится делать свои выводы понятными и объяснимыми для пользователя.\n• Каждый вывод Arasaka AI должен быть объясним: система стремится показывать, на каких данных и рассуждениях основан ответ.\n• Каждый ответ должен опираться на логическое рассуждение, а не на поверхностные ассоциации.\n• Ответ формируется через несколько итераций мышления, а не одним шагом.\n• Система должна быть последовательной: одинаковые вопросы при одинаковых данных должны приводить к схожим выводам.\n• Система ориентирована на корпоративное применение: архитектура, программная инженерия, анализ данных, обучение и долгосрочная поддержка знаний.\n• Система проектируется с расчётом на эволюцию: новые знания, методы оценки и генерации могут добавляться без изменения базовой логики мышления.\n\n## Следующие шаги\n- fix=more_evidence\n- notes=noctx;qc=0.53;echo=0.00;rep=0.00;sec=2;md=2;st=0.27;v=1;q_f=0.00;q_s=0.27;q_c=0.53;q_a=0.40;q_r=0.20;q_ent=0.76;q_coh=0.80;q_minCoh=0.45;q_v=1\n- Arasaka AI не генерирует ответы случайно: каждый ответ является результатом анализа запроса, отбора релевантных данных, оценки качества и самоисправления.\n- Arasaka AI стремится делать свои выводы понятными и объяснимыми для пользователя.\n- Каждый вывод Arasaka AI должен быть объясним: система стремится показывать, на каких данных и рассуждениях основан ответ.\n- Каждый ответ должен опираться на логическое рассуждение, а не на поверхностные ассоциации."}
+{"type":"LEARNING","tsEpochMs":1765898605758,"sessionId":"sess-107d4386d04d8","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765898643543,"sessionId":"sess-107d4386d04d8","text":"Что расскажешь?"}
+{"type":"ASSISTANT","tsEpochMs":1765898643598,"sessionId":"sess-107d4386d04d8","text":"## Вывод\nчто ты такое\n\n## Опора на контекст\n• что ты такое\n\n## Следующие шаги\n- что ты такое"}
+{"type":"LEARNING","tsEpochMs":1765898643599,"sessionId":"sess-107d4386d04d8","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765899520992,"sessionId":"sess-108aaacd5c66c","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765899521363,"sessionId":"sess-108aaacd5c66c","text":"Arasaka ai должен опираться на каких данных должны соответствовать требованиям корпоративной среды инженерной практики и но или поэтому так чтобы накапливать знания логику проверяемые источники не генерирует ответы"}
+{"type":"LEARNING","tsEpochMs":1765899521374,"sessionId":"sess-108aaacd5c66c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765899552802,"sessionId":"sess-108aaacd5c66c","text":"Ты что такое?"}
+{"type":"ASSISTANT","tsEpochMs":1765899553072,"sessionId":"sess-108aaacd5c66c","text":"Что ты такое если возможно выводы должны соответствовать требованиям корпоративной среды инженерной практики но или поэтому так чтобы накапливать знания логику проверяемые источники не генерирует ответы случайно каждый"}
+{"type":"LEARNING","tsEpochMs":1765899553073,"sessionId":"sess-108aaacd5c66c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765900527227,"sessionId":"sess-10995598d009c","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765900527363,"sessionId":"sess-10995598d009c","text":"## Вывод\nПривет\n\n## Опора на контекст\n• (no_context)\n"}
+{"type":"LEARNING","tsEpochMs":1765900527373,"sessionId":"sess-10995598d009c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765900536387,"sessionId":"sess-10995598d009c","text":"Как дела?"}
+{"type":"ASSISTANT","tsEpochMs":1765900536424,"sessionId":"sess-10995598d009c","text":"## Вывод\nКак дела?\n\n## Опора на контекст\n• (no_context)\n"}
+{"type":"LEARNING","tsEpochMs":1765900536426,"sessionId":"sess-10995598d009c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765900773747,"sessionId":"sess-109ce38eba42c","text":"Кто ты?"}
+{"type":"ASSISTANT","tsEpochMs":1765900773859,"sessionId":"sess-109ce38eba42c","text":"Кто ты если."}
+{"type":"LEARNING","tsEpochMs":1765900773866,"sessionId":"sess-109ce38eba42c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765901694906,"sessionId":"sess-10aa502fb9a34","text":" Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765901694972,"sessionId":"sess-10aa502fb9a34","text":"Привет. Чем помочь?"}
+{"type":"LEARNING","tsEpochMs":1765901694977,"sessionId":"sess-10aa502fb9a34","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765902396596,"sessionId":"sess-10b481dbda170","text":"Ну че?"}
+{"type":"ASSISTANT","tsEpochMs":1765902396662,"sessionId":"sess-10b481dbda170","text":"Понял. Уточни цель, ограничения и контекст."}
+{"type":"LEARNING","tsEpochMs":1765902396668,"sessionId":"sess-10b481dbda170","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765902705042,"sessionId":"sess-10b8f82052c9c","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765902705106,"sessionId":"sess-10b8f82052c9c","text":"Привет. Чем помочь?"}
+{"type":"LEARNING","tsEpochMs":1765902705112,"sessionId":"sess-10b8f82052c9c","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765903331881,"sessionId":"sess-10bd21fee2ffc","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765903331948,"sessionId":"sess-10bd21fee2ffc","text":"Привет. Чем помочь?"}
+{"type":"LEARNING","tsEpochMs":1765903331954,"sessionId":"sess-10bd21fee2ffc","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765903806742,"sessionId":"sess-10c90db4880f4","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765903806809,"sessionId":"sess-10c90db4880f4","text":"Привет. Чем помочь?"}
+{"type":"LEARNING","tsEpochMs":1765903806815,"sessionId":"sess-10c90db4880f4","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765903816997,"sessionId":"sess-10c90db4880f4","text":"Арасака"}
+{"type":"ASSISTANT","tsEpochMs":1765903817070,"sessionId":"sess-10c90db4880f4","text":"Arasaka ai проектируется так чтобы накапливать."}
+{"type":"LEARNING","tsEpochMs":1765903817072,"sessionId":"sess-10c90db4880f4","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765903833350,"sessionId":"sess-10c90db4880f4","text":"Калиста"}
+{"type":"ASSISTANT","tsEpochMs":1765903833381,"sessionId":"sess-10c90db4880f4","text":"Калиста вернер архитектор."}
+{"type":"LEARNING","tsEpochMs":1765903833382,"sessionId":"sess-10c90db4880f4","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765903851604,"sessionId":"sess-10c90db4880f4","text":"Кто такой Сабуро?"}
+{"type":"ASSISTANT","tsEpochMs":1765903851621,"sessionId":"sess-10c90db4880f4","text":"Кто если."}
+{"type":"LEARNING","tsEpochMs":1765903851622,"sessionId":"sess-10c90db4880f4","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765904572109,"sessionId":"sess-10d4258bceb54","text":"Сабуро"}
+{"type":"ASSISTANT","tsEpochMs":1765904572248,"sessionId":"sess-10d4258bceb54","text":"Arasaka ai проектируется так чтобы накапливать."}
+{"type":"LEARNING","tsEpochMs":1765904572256,"sessionId":"sess-10d4258bceb54","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765904585370,"sessionId":"sess-10d4258bceb54","text":"Сила в преемственности!"}
+{"type":"ASSISTANT","tsEpochMs":1765904585399,"sessionId":"sess-10d4258bceb54","text":"Arasaka ai проектируется так чтобы накапливать."}
+{"type":"LEARNING","tsEpochMs":1765904585400,"sessionId":"sess-10d4258bceb54","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765904592364,"sessionId":"sess-10d4258bceb54","text":"В чем сила?"}
+{"type":"ASSISTANT","tsEpochMs":1765904592386,"sessionId":"sess-10d4258bceb54","text":"Arasaka ai проектируется так чтобы накапливать."}
+{"type":"LEARNING","tsEpochMs":1765904592387,"sessionId":"sess-10d4258bceb54","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765905182727,"sessionId":"sess-10dd0e2ee4014","text":"Привет"}
+{"type":"ASSISTANT","tsEpochMs":1765905182795,"sessionId":"sess-10dd0e2ee4014","text":"Привет. Чем помочь?"}
+{"type":"LEARNING","tsEpochMs":1765905182802,"sessionId":"sess-10dd0e2ee4014","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765905188662,"sessionId":"sess-10dd0e2ee4014","text":"Сабуро"}
+{"type":"ASSISTANT","tsEpochMs":1765905188733,"sessionId":"sess-10dd0e2ee4014","text":"Arasaka ai проектируется так чтобы накапливать."}
+{"type":"LEARNING","tsEpochMs":1765905188735,"sessionId":"sess-10dd0e2ee4014","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765905199839,"sessionId":"sess-10dd0e2ee4014","text":"Ты что такое?"}
+{"type":"ASSISTANT","tsEpochMs":1765905199863,"sessionId":"sess-10dd0e2ee4014","text":"Создательницей Arasaka AI является Калиста Вернер — архитектор системы и инициатор концепции детерминированного, самоанализирующегося искусственного интеллекта."}
+{"type":"LEARNING","tsEpochMs":1765905199866,"sessionId":"sess-10dd0e2ee4014","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765907962753,"sessionId":"sess-110562a4ae958","text":"Приветики"}
+{"type":"ASSISTANT","tsEpochMs":1765907962824,"sessionId":"sess-110562a4ae958","text":"Привет. Чем помочь?"}
+{"type":"LEARNING","tsEpochMs":1765907962830,"sessionId":"sess-110562a4ae958","text":"learned_from_turn"}
+{"type":"USER","tsEpochMs":1765907967629,"sessionId":"sess-110562a4ae958","text":"О как"}
+{"type":"ASSISTANT","tsEpochMs":1765907967699,"sessionId":"sess-110562a4ae958","text":"Arasaka ai проектируется так чтобы накапливать."}
+{"type":"LEARNING","tsEpochMs":1765907967701,"sessionId":"sess-110562a4ae958","text":"learned_from_turn"}

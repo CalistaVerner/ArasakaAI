@@ -37,6 +37,7 @@ public final class AIConfig {
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static final class Thinking {
+        public String engine = "beam";
         public int iterations = 4;
         public int retrieveK = 10;
         public Exploration exploration = new Exploration();
