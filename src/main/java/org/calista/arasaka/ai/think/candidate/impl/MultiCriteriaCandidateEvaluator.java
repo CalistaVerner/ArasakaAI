@@ -1,9 +1,9 @@
+// FILE: MultiCriteriaCandidateEvaluator.java
 package org.calista.arasaka.ai.think.candidate.impl;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.calista.arasaka.ai.knowledge.Statement;
-import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
 
 import java.util.List;
@@ -11,25 +11,29 @@ import java.util.Locale;
 import java.util.Objects;
 
 /**
- * QuantumCandidateEvaluator
- *
- * Enterprise / Neural evaluator:
- * - multi-channel (superposition) scoring
+ * MultiCriteriaCandidateEvaluator (Quantum-like):
+ * - multi-channel scoring
  * - coherence & entropy penalties
- * - deterministic, no randomness
+ * - deterministic (no randomness)
  *
- * Designed for NeuralQuantumEngine.
+ * Added:
+ *  - strict verify-pass mode via evaluateStrict(...)
  */
-public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator {
+public final class MultiCriteriaCandidateEvaluator implements org.calista.arasaka.ai.think.candidate.CandidateEvaluator {
 
     private static final Logger log = LogManager.getLogger(MultiCriteriaCandidateEvaluator.class);
 
-    private final AdvancedCandidateEvaluator base;
+    private final CandidateEvaluator base;
 
     // --- quantum policy knobs ---
     private final double minCoherence;        // 0..1
     private final double entropyPenaltyWeight;
     private final double coherenceWeight;
+
+    // --- strict verify knobs ---
+    private final double strictMinCoherenceBoost;     // +0.12
+    private final double strictEntropyBoost;          // +0.10
+    private final double strictRiskWeight;            // 0.45 (vs 0.30)
 
     // --- debug knobs ---
     private final boolean debugEnabled;
@@ -37,29 +41,46 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
 
     public MultiCriteriaCandidateEvaluator(Tokenizer tokenizer) {
         this(
-                new AdvancedCandidateEvaluator(tokenizer),
+                new CandidateEvaluator(tokenizer),
                 0.45,
                 0.35,
                 0.40,
+                0.12,
+                0.10,
+                0.45,
                 false,
                 180
         );
     }
 
     public MultiCriteriaCandidateEvaluator(
-            AdvancedCandidateEvaluator base,
+            CandidateEvaluator base,
             double minCoherence,
             double entropyPenaltyWeight,
             double coherenceWeight
     ) {
-        this(base, minCoherence, entropyPenaltyWeight, coherenceWeight, false, 180);
+        this(base, minCoherence, entropyPenaltyWeight, coherenceWeight, 0.12, 0.10, 0.45, false, 180);
     }
 
     public MultiCriteriaCandidateEvaluator(
-            AdvancedCandidateEvaluator base,
+            CandidateEvaluator base,
             double minCoherence,
             double entropyPenaltyWeight,
             double coherenceWeight,
+            boolean debugEnabled,
+            int debugSnippetChars
+    ) {
+        this(base, minCoherence, entropyPenaltyWeight, coherenceWeight, 0.12, 0.10, 0.45, debugEnabled, debugSnippetChars);
+    }
+
+    public MultiCriteriaCandidateEvaluator(
+            CandidateEvaluator base,
+            double minCoherence,
+            double entropyPenaltyWeight,
+            double coherenceWeight,
+            double strictMinCoherenceBoost,
+            double strictEntropyBoost,
+            double strictRiskWeight,
             boolean debugEnabled,
             int debugSnippetChars
     ) {
@@ -67,6 +88,11 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
         this.minCoherence = clamp01(minCoherence);
         this.entropyPenaltyWeight = clamp01(entropyPenaltyWeight);
         this.coherenceWeight = clamp01(coherenceWeight);
+
+        this.strictMinCoherenceBoost = clamp01(strictMinCoherenceBoost);
+        this.strictEntropyBoost = clamp01(strictEntropyBoost);
+        this.strictRiskWeight = clamp01(strictRiskWeight);
+
         this.debugEnabled = debugEnabled;
         this.debugSnippetChars = Math.max(40, debugSnippetChars);
     }
@@ -78,6 +104,19 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
 
     @Override
     public Evaluation evaluate(String userText, String candidateText, List<Statement> context) {
+        return evaluateInternal(userText, candidateText, context, false);
+    }
+
+    /**
+     * Strict verify-pass evaluation:
+     * - higher min coherence
+     * - stronger entropy + contradiction risk penalty
+     */
+    public Evaluation evaluateStrict(String userText, String candidateText, List<Statement> context) {
+        return evaluateInternal(userText, candidateText, context, true);
+    }
+
+    private Evaluation evaluateInternal(String userText, String candidateText, List<Statement> context, boolean strict) {
         final long t0 = System.nanoTime();
 
         final String q = userText == null ? "" : userText.trim();
@@ -102,14 +141,19 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
         // ---- Coherence (signals agree with each other) ----
         double coherence = coherence(channels);
 
+        // strict adjustments
+        double minCoh = strict ? clamp01(this.minCoherence + strictMinCoherenceBoost) : this.minCoherence;
+        double entW = strict ? clamp01(this.entropyPenaltyWeight + strictEntropyBoost) : this.entropyPenaltyWeight;
+        double riskW = strict ? this.strictRiskWeight : 0.30;
+
         // ---- Quantum-adjusted score ----
         double quantumScore =
                 e.score
                         + coherenceWeight * coherence
-                        - entropyPenaltyWeight * entropy
-                        - 0.30 * risk;
+                        - entW * entropy
+                        - riskW * risk;
 
-        boolean valid = e.valid && coherence >= minCoherence;
+        boolean valid = e.valid && coherence >= minCoh;
 
         String telemetry =
                 e.validationNotes
@@ -120,7 +164,10 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
                         + ";q_r=" + fmt2(risk)
                         + ";q_ent=" + fmt2(entropy)
                         + ";q_coh=" + fmt2(coherence)
-                        + ";q_minCoh=" + fmt2(minCoherence)
+                        + ";q_minCoh=" + fmt2(minCoh)
+                        + ";q_entW=" + fmt2(entW)
+                        + ";q_rW=" + fmt2(riskW)
+                        + ";q_strict=" + (strict ? 1 : 0)
                         + ";q_v=" + (valid ? 1 : 0);
 
         long nanos = System.nanoTime() - t0;
@@ -140,17 +187,16 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
                 nanos
         );
 
-        // ---- DEBUG LOGS ----
-        // 1) Always: if result flips validity or coherence is low => log at DEBUG (useful to tune thresholds)
         if (log.isDebugEnabled()) {
             boolean flip = (e.valid != valid);
-            boolean lowC = coherence < minCoherence;
+            boolean lowC = coherence < minCoh;
 
-            if (debugEnabled || flip || lowC) {
+            if (debugEnabled || flip || lowC || strict) {
                 log.debug(
-                        "QuantumEval | ctx={} tok={} baseScore={} qScore={} eff={} valid={} (baseValid={}) " +
+                        "QuantumEval | strict={} ctx={} tok={} baseScore={} qScore={} eff={} valid={} (baseValid={}) " +
                                 "| g={} st={} cov={} act={} risk={} coh={} ent={} " +
                                 "| q='{}' a='{}'",
+                        strict ? 1 : 0,
                         ctxSize,
                         e.tokens,
                         fmt4(e.score),
@@ -171,7 +217,6 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
             }
         }
 
-        // 2) TRACE-like details via DEBUG: only when explicitly enabled
         if (debugEnabled && log.isDebugEnabled()) {
             log.debug("QuantumEvalTelemetry | {}", telemetry);
         }
@@ -181,10 +226,6 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
 
     // -------------------- quantum math --------------------
 
-    /**
-     * Entropy of channel distribution.
-     * High entropy = chaotic / unbalanced answer.
-     */
     private static double entropy(double[] v) {
         double sum = 0.0;
         for (double x : v) sum += x;
@@ -200,10 +241,6 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
         return clamp01(h / Math.log(v.length));
     }
 
-    /**
-     * Coherence = 1 - normalized variance.
-     * High when channels are aligned.
-     */
     private static double coherence(double[] v) {
         double mean = 0.0;
         for (double x : v) mean += x;
@@ -219,10 +256,6 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
         return clamp01(1.0 - Math.sqrt(var));
     }
 
-    /**
-     * Actionability proxy:
-     * reuse structure/coverage signals without re-parsing text.
-     */
     private static double estimateActionability(Evaluation e) {
         double a = 0.0;
         a += 0.5 * clamp01(e.structureScore);

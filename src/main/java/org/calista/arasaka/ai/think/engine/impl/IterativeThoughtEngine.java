@@ -1,3 +1,4 @@
+// FILE: IterativeThoughtEngine.java
 package org.calista.arasaka.ai.think.engine.impl;
 
 import org.apache.logging.log4j.CloseableThreadContext;
@@ -10,7 +11,9 @@ import org.calista.arasaka.ai.retrieve.retriver.impl.KnowledgeRetriever;
 import org.calista.arasaka.ai.think.ThoughtResult;
 import org.calista.arasaka.ai.think.ThoughtState;
 import org.calista.arasaka.ai.think.candidate.Candidate;
+import org.calista.arasaka.ai.think.candidate.CandidateControlSignals;
 import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
+import org.calista.arasaka.ai.think.candidate.impl.MultiCriteriaCandidateEvaluator;
 import org.calista.arasaka.ai.think.engine.ThoughtCycleEngine;
 import org.calista.arasaka.ai.think.intent.Intent;
 import org.calista.arasaka.ai.think.intent.IntentDetector;
@@ -20,6 +23,7 @@ import org.calista.arasaka.ai.think.textGenerator.TextGenerator;
 import java.text.Normalizer;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -27,20 +31,18 @@ import java.util.stream.Collectors;
  * Enterprise deterministic think-loop:
  * retrieve -> rerank -> compress -> draft -> evaluate -> self-correct -> (optional) LTM.
  *
- * Key fixes in this version:
+ * Key enterprise upgrades in this version:
+ *  3.1 Two-phase pipeline Explore -> Exploit (state.tags + few config knobs).
+ *  3.2 Mandatory strict verify-pass for best candidate (repair tags + force continue).
+ *  3.3 Hybrid rerank: overlap + source priority + LTM penalty + DF penalty (no new entities).
+ *  3.5 Anti-collapse deterministic diversity: per-draft seed mixing + gen.diversity tags.
+ *  3.6 LTM self-regulation: decay + promotion (fresh retrieval confirms -> priority boost).
+ *
+ * Previous fixes retained:
  *  - DO NOT poison retrieval with "UNKNOWN" intent token.
  *  - DO NOT derive refine queries from a bad/invalid bestSoFar.
- *  - DO NOT collapse drafts to 1 when generator mode-collapses (keep 2..4 for evaluator).
- *  - For very short inputs (<=2 tokens) use "summary" only sections (no "need context" behavior).
- *
- * Ownership fix:
- *  - Evaluation executor is injected (owned by Think orchestrator).
- *  - No static pools here.
- *
- * Logging policy:
- *  - INFO  : start/end + per-iteration compact summary
- *  - DEBUG : queries, stop reason, top candidates summary, retrieval type/quality
- *  - TRACE : context previews, drafts previews, derived queries, tags
+ *  - Keep multiple drafts (avoid mode collapse).
+ *  - Very short inputs (<=2 tokens) -> summary-only.
  */
 public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
@@ -57,11 +59,20 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             + "(\\bno_context\\b)|(\\bnoctx\\b)|(\\bmore_evidence\\b)|(\\bfix\\b)|(\\bnotes\\b)");
 
     // --- RAG knobs ---
-    private static final int RERANK_N = 80;
-    private static final int RERANK_M = 16;
+    private static final int RERANK_N = 120;
+    private static final int RERANK_M = 18;
     private static final int COMPRESS_SENTENCES = 2;
     private static final int COMPRESS_MAX_CHARS = 700;
     private static final double DERIVE_DF_CUT = 0.60;
+
+    // --- Explore/Exploit defaults (can be overridden by Think.Config) ---
+    private final int exploreIters;
+    private final double exploreRetrieveKMult;
+    private final double exploitEvidenceStrictness;
+
+    // --- strict verify-pass policy ---
+    private final boolean strictVerifyEnabled;
+    private final double strictVerifyMinScore;
 
     private final Retriever retriever;
     private final IntentDetector intentDetector;
@@ -89,6 +100,12 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     private final ConcurrentMap<String, Double> ltmPriorityByKey = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Set<String>> ltmTokensByKey = new ConcurrentHashMap<>();
 
+    // LTM self-regulation
+    private final AtomicLong ltmTick = new AtomicLong(0);
+    private final ConcurrentMap<String, Long> ltmLastTouchTick = new ConcurrentHashMap<>();
+    private final double ltmDecayPerTick;     // e.g. 0.0015
+    private final double ltmPromotionBoost;   // e.g. +0.06
+
     // refinement
     private final int refineRounds;
     private final int refineQueryBudget;
@@ -98,7 +115,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     private final List<StopRule> stopRules;
 
     /**
-     * Основной конструктор (рекомендуемый): evalPool и параллелизм инжектятся сверху (Think).
+     * Backward-compatible constructor (old signature): uses built-in defaults for new knobs.
      */
     public IterativeThoughtEngine(
             Retriever retriever,
@@ -122,9 +139,16 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 evalPool, evalParallelism,
                 iterations, retrieveK, draftsPerIteration, patience, targetScore,
                 ltmEnabled, ltmCapacity, ltmRecallK, ltmWriteMinGroundedness,
-                1, 16);
+                1, 16,
+                2, 1.5, 0.78,
+                true, 0.62,
+                0.0015, 0.06
+        );
     }
 
+    /**
+     * Backward-compatible constructor (old + refine): uses built-in defaults for new knobs.
+     */
     public IterativeThoughtEngine(
             Retriever retriever,
             IntentDetector intentDetector,
@@ -144,6 +168,47 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             double ltmWriteMinGroundedness,
             int refineRounds,
             int refineQueryBudget
+    ) {
+        this(retriever, intentDetector, strategy, evaluator, generator,
+                evalPool, evalParallelism,
+                iterations, retrieveK, draftsPerIteration, patience, targetScore,
+                ltmEnabled, ltmCapacity, ltmRecallK, ltmWriteMinGroundedness,
+                refineRounds, refineQueryBudget,
+                2, 1.5, 0.78,
+                true, 0.62,
+                0.0015, 0.06
+        );
+    }
+
+    /**
+     * Full constructor (new knobs injected from Think.Config).
+     */
+    public IterativeThoughtEngine(
+            Retriever retriever,
+            IntentDetector intentDetector,
+            ResponseStrategy strategy,
+            CandidateEvaluator evaluator,
+            TextGenerator generator,
+            ExecutorService evalPool,
+            int evalParallelism,
+            int iterations,
+            int retrieveK,
+            int draftsPerIteration,
+            int patience,
+            double targetScore,
+            boolean ltmEnabled,
+            int ltmCapacity,
+            int ltmRecallK,
+            double ltmWriteMinGroundedness,
+            int refineRounds,
+            int refineQueryBudget,
+            int exploreIters,
+            double exploreRetrieveKMult,
+            double exploitEvidenceStrictness,
+            boolean strictVerifyEnabled,
+            double strictVerifyMinScore,
+            double ltmDecayPerTick,
+            double ltmPromotionBoost
     ) {
         this.retriever = Objects.requireNonNull(retriever, "retriever");
         this.intentDetector = Objects.requireNonNull(intentDetector, "intentDetector");
@@ -171,6 +236,16 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         this.refineRounds = Math.max(0, refineRounds);
         this.refineQueryBudget = Math.max(1, refineQueryBudget);
 
+        this.exploreIters = Math.max(0, exploreIters);
+        this.exploreRetrieveKMult = Math.max(1.0, exploreRetrieveKMult);
+        this.exploitEvidenceStrictness = clamp01(exploitEvidenceStrictness);
+
+        this.strictVerifyEnabled = strictVerifyEnabled;
+        this.strictVerifyMinScore = strictVerifyMinScore;
+
+        this.ltmDecayPerTick = Math.max(0.0, ltmDecayPerTick);
+        this.ltmPromotionBoost = Math.max(0.0, ltmPromotionBoost);
+
         this.queryProviders = List.of(
                 QueryProvider.userText(),
                 QueryProvider.intentName(),       // FIX: skips UNKNOWN
@@ -190,9 +265,11 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         );
 
         if (log.isInfoEnabled()) {
-            log.info("IterativeThoughtEngine created: iterations={} retrieveK={} draftsPerIter={} patience={} targetScore={} refineRounds={} refineQueryBudget={} ltmEnabled={} ltmCap={} ltmRecallK={} evalPar={}",
+            log.info("IterativeThoughtEngine created: iterations={} retrieveK={} draftsPerIter={} patience={} targetScore={} refineRounds={} refineQueryBudget={} exploreIters={} exploreKMult={} exploitStrict={} strictVerify={} strictMinScore={} ltmEnabled={} ltmCap={} ltmRecallK={} evalPar={}",
                     this.iterations, this.retrieveK, this.draftsPerIteration, this.patience, fmt(this.targetScore),
                     this.refineRounds, this.refineQueryBudget,
+                    this.exploreIters, fmt(this.exploreRetrieveKMult), fmt(this.exploitEvidenceStrictness),
+                    this.strictVerifyEnabled, fmt(this.strictVerifyMinScore),
                     this.ltmEnabled, this.ltmCapacity, this.ltmRecallK,
                     this.evalParallelism);
         }
@@ -227,23 +304,31 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             state.generator = generator;
             state.query = q0;
 
-            if (state.tags == null) state.tags = new HashMap<>(16);
+            if (state.tags == null) state.tags = new HashMap<>(24);
             initResponseSchema(state, q0, intent); // FIX: short queries => summary only
 
             Candidate globalBest = new Candidate("", Double.NEGATIVE_INFINITY, "", null);
             state.bestSoFar = globalBest;
             state.bestEvaluation = null;
 
-            List<String> trace = new ArrayList<>(Math.max(8, iterations * 3));
+            List<String> trace = new ArrayList<>(Math.max(10, iterations * 4));
             trace.add("reqId=" + reqId + " seed=" + Long.toUnsignedString(seed));
 
             int stagnation = 0;
             StopDecision stopDecision = null;
 
-            for (int iter = 1; iter <= iterations; iter++) {
+            // if strict verify fails, we prevent early stop this episode
+            int forcedExtraIters = 0;
+
+            for (int iter = 1; iter <= iterations + forcedExtraIters; iter++) {
                 state.iteration = iter;
-                state.seed = mix(seed, iter);
+                long iterSeed = mix(seed, iter);
+                state.seed = iterSeed;
                 ThreadContext.put("iter", Integer.toString(iter));
+
+                // 3.1 Explore -> Exploit
+                boolean explore = (iter <= exploreIters);
+                setPhaseControls(state, explore);
 
                 // generator hint only (never used for retrieval)
                 state.generationHint = buildGenerationHint(state);
@@ -251,13 +336,21 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 // ---- queries ----
                 List<String> baseQueries = buildQueries(q0, state);
                 if (log.isDebugEnabled()) {
-                    log.debug("iter={} queries.n={} queries={}", iter, baseQueries.size(), baseQueries);
+                    log.debug("iter={} phase={} queries.n={} queries={}", iter, explore ? "EXPLORE" : "EXPLOIT", baseQueries.size(), baseQueries);
                 }
 
                 // ---- retrieve/rerank/compress ----
                 final long tRetr0 = System.nanoTime();
-                RetrievalBundle bundle = retrieveRerankCompress(q0, baseQueries, state.seed);
+
+                int effK = explore ? (int) Math.ceil(retrieveK * exploreRetrieveKMult) : retrieveK;
+
+                RetrievalBundle bundle = retrieveRerankCompress(q0, baseQueries, iterSeed, effK);
                 final long tRetr = System.nanoTime() - tRetr0;
+
+                // 3.6 Promotion: if fresh retrieval matches LTM => boost
+                if (ltmEnabled) {
+                    promoteLtmOnFreshEvidence(bundle.rawEvidence);
+                }
 
                 // ---- LTM recall ----
                 final long tLtm0 = System.nanoTime();
@@ -265,16 +358,40 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 state.recalledMemory = recalled;
                 final long tLtm = System.nanoTime() - tLtm0;
 
+                // ---- merge + hybrid rerank ----
+                final Map<String, Byte> origin = new HashMap<>(256); // 1=retrieval, 2=ltm, 3=both
+                if (bundle.rawEvidence != null) {
+                    for (Statement s : bundle.rawEvidence) {
+                        String k = stableStmtKey(s);
+                        if (k != null) origin.put(k, (byte) 1);
+                    }
+                }
+                if (recalled != null && !recalled.isEmpty()) {
+                    for (Statement s : recalled) {
+                        String k = stableStmtKey(s);
+                        if (k == null) continue;
+                        origin.merge(k, (byte) 2, (a, b) -> (byte) (a | b));
+                    }
+                }
+
                 if (!recalled.isEmpty()) {
                     Map<String, Statement> mergedByKey = new ConcurrentHashMap<>();
                     mergeStatements(bundle.rawEvidence, mergedByKey);
                     mergeStatements(recalled, mergedByKey);
 
                     List<Statement> merged = toDeterministicContext(mergedByKey);
-                    List<Statement> reranked = rerankContext(q0, merged, RERANK_N, RERANK_M);
+
+                    DfStats df = buildDfStats(merged, 96);
+                    List<Statement> reranked = rerankContextHybrid(q0, merged, RERANK_N, RERANK_M, origin, df.df, df.docs);
                     List<Statement> compressed = compressContextToStatements(q0, reranked, COMPRESS_SENTENCES, COMPRESS_MAX_CHARS);
 
                     bundle = bundle.withMerged(merged, reranked, compressed);
+                } else {
+                    // even without LTM: rerank hybrid with source priority + DF penalty
+                    DfStats df = buildDfStats(bundle.rawEvidence, 96);
+                    List<Statement> reranked = rerankContextHybrid(q0, bundle.rawEvidence, RERANK_N, RERANK_M, origin, df.df, df.docs);
+                    List<Statement> compressed = compressContextToStatements(q0, reranked, COMPRESS_SENTENCES, COMPRESS_MAX_CHARS);
+                    bundle = bundle.withMerged(bundle.rawEvidence, reranked, compressed);
                 }
 
                 // ---- context for generator (compressed first) ----
@@ -285,8 +402,8 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 state.lastContext = context;
 
                 if (log.isTraceEnabled()) {
-                    log.trace("iter={} ctx.raw.n={} ctx.rerank.n={} ctx.compress.n={} ctx.preview={}",
-                            iter,
+                    log.trace("iter={} phase={} ctx.raw.n={} ctx.rerank.n={} ctx.compress.n={} ctx.preview={}",
+                            iter, explore ? "EXPLORE" : "EXPLOIT",
                             safeSize(bundle.rawEvidence), safeSize(bundle.rerankedContext), safeSize(bundle.compressedContext),
                             previewContext(context, 3, 260));
                 }
@@ -294,13 +411,25 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 // ---- deterministic generation control (tags) ----
                 tuneGenerationTags(state, q0, context);
 
-                if (log.isTraceEnabled() && state.tags != null && !state.tags.isEmpty()) {
-                    log.trace("iter={} tags={}", iter, stableSmallMap(state.tags, 32));
+                // 3.5: explicit diversity tag for generator
+                state.tags.put("gen.diversity", explore ? "high" : "low");
+                state.tags.put("think.phase", explore ? "explore" : "exploit");
+                // expose stricter constraints to generator in exploit
+                if (!explore) {
+                    state.tags.put("eval.grounded.min", fmt(this.exploitEvidenceStrictness));
+                    state.tags.put("repair.require_evidence", "true");
+                    state.tags.put("repair.forbid_generic", "true");
+                } else {
+                    state.tags.put("eval.grounded.min", fmt(0.60));
                 }
 
-                // ---- drafts ----
+                if (log.isTraceEnabled() && state.tags != null && !state.tags.isEmpty()) {
+                    log.trace("iter={} tags={}", iter, stableSmallMap(state.tags, 40));
+                }
+
+                // ---- drafts (deterministic diversity) ----
                 final long tGen0 = System.nanoTime();
-                List<String> drafts = Drafts.sanitize(generateDrafts(q0, context, state), draftsPerIteration);
+                List<String> drafts = Drafts.sanitize(generateDraftsDeterministic(q0, context, state, iterSeed), draftsPerIteration);
                 final long tGen = System.nanoTime() - tGen0;
 
                 if (log.isTraceEnabled()) {
@@ -328,6 +457,36 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                     stagnation++;
                 }
 
+                // 3.2 Strict verify-pass (optionally gated by score)
+                boolean strictOk = true;
+                boolean strictTried = false;
+
+                if (strictVerifyEnabled && bestIter != null
+                        && (bestIter.score >= strictVerifyMinScore || improved)) {
+
+                    Candidate strictChecked = strictVerifyCandidate(q0, context, bestIter);
+                    strictTried = true;
+                    strictOk = (strictChecked.evaluation != null && strictChecked.evaluation.valid);
+
+                    if (!strictOk) {
+                        // force repair mode; ensure loop continues (even if stop rules would fire)
+                        applyStrictRepairTags(state);
+                        state.phase = CandidateControlSignals.Phase.REPAIR.ordinal();
+                        state.diversity = CandidateControlSignals.Diversity.MEDIUM.ordinal();
+
+                        // Prevent premature stop: add exactly +1 extra iter (at most 2 total)
+                        if (forcedExtraIters < 2) forcedExtraIters++;
+
+                        // Also treat as "not improved" for stagnation logic (avoid locking-in bad best)
+                        stagnation = Math.max(0, stagnation - 1);
+
+                        // Keep globalBest as-is (do not promote failed strict candidate)
+                        bestIter = strictChecked;
+                    } else {
+                        clearStrictRepairTags(state.tags);
+                    }
+                }
+
                 // ---- LTM writeback (evidence-only) ----
                 if (ltmEnabled && bestIter.evaluation != null && bestIter.evaluation.valid) {
                     int before = ltmByKey.size();
@@ -339,6 +498,8 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 }
 
                 trace.add("iter=" + iter
+                        + " phase=" + (explore ? "explore" : "exploit")
+                        + " effK=" + effK
                         + " raw=" + safeSize(bundle.rawEvidence)
                         + " rerank=" + safeSize(bundle.rerankedContext)
                         + " compress=" + safeSize(bundle.compressedContext)
@@ -347,6 +508,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                         + " bestIter=" + fmt(bestIter.score)
                         + " global=" + fmt(globalBest.score)
                         + " stg=" + stagnation
+                        + " strict=" + (strictTried ? (strictOk ? "ok" : "fail") : "skip")
                         + " tRetrMs=" + (tRetr / 1_000_000)
                         + " tLtmMs=" + (tLtm / 1_000_000)
                         + " tGenMs=" + (tGen / 1_000_000)
@@ -356,8 +518,9 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 // ---- per-iteration compact summary (INFO) ----
                 if (log.isInfoEnabled()) {
                     CandidateEvaluator.Evaluation ev = bestIter.evaluation;
-                    log.info("think.iter iter={} improved={} stg={} bestIter={} global={} eff={} valid={} g={} cs={} cov={} st={} risk={} ctx={} ltm={} drafts={} tRetrMs={} tLtmMs={} tGenMs={} tEvalMs={}{}",
-                            iter, improved, stagnation,
+                    log.info("think.iter iter={} phase={} improved={} stg={} bestIter={} global={} eff={} valid={} g={} cs={} cov={} st={} risk={} ctx={} ltm={} drafts={} strict={} tRetrMs={} tLtmMs={} tGenMs={} tEvalMs={}{}",
+                            iter, (explore ? "EXPLORE" : "EXPLOIT"),
+                            improved, stagnation,
                             fmt(bestIter.score), fmt(globalBest.score),
                             fmt(ev == null ? 0.0 : ev.effectiveScore()),
                             (ev != null && ev.valid),
@@ -369,6 +532,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                             safeSize(context),
                             (state.recalledMemory == null ? 0 : state.recalledMemory.size()),
                             drafts.size(),
+                            (strictTried ? (strictOk ? "ok" : "fail") : "skip"),
                             (tRetr / 1_000_000), (tLtm / 1_000_000), (tGen / 1_000_000), (tEval / 1_000_000),
                             bundle.traceQuality != null ? (" rq=" + fmt(bundle.traceQuality)) : "");
                 }
@@ -380,6 +544,11 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
                 // ---- stop ----
                 stopDecision = shouldStopWithReason(state, globalBest, stagnation);
+                // if strict verify failed in this iter, do not stop
+                if (state.tags != null && "1".equals(state.tags.get("repair.verifyFail"))) {
+                    stopDecision = new StopDecision(false, "strict_repair_forced");
+                }
+
                 if (stopDecision.stop) {
                     if (log.isDebugEnabled()) {
                         log.debug("think.stop iter={} reason={} bestScore={} target={} stg={} patience={}",
@@ -415,6 +584,56 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
             return new ThoughtResult(globalBest == null ? "" : globalBest.text, trace, intent, globalBest, ev);
         }
+    }
+
+    // -------------------- explore/exploit controls --------------------
+
+    private void setPhaseControls(ThoughtState state, boolean explore) {
+        if (state == null) return;
+
+        state.phase = explore
+                ? CandidateControlSignals.Phase.EXPLORE.ordinal()
+                : CandidateControlSignals.Phase.EXPLOIT.ordinal();
+
+        state.diversity = explore
+                ? CandidateControlSignals.Diversity.HIGH.ordinal()
+                : CandidateControlSignals.Diversity.LOW.ordinal();
+
+        state.evidenceStrictness = explore ? 0.62 : exploitEvidenceStrictness;
+    }
+
+    // -------------------- strict verify-pass --------------------
+
+    private Candidate strictVerifyCandidate(String userText, List<Statement> context, Candidate best) {
+        if (best == null) return new Candidate("", Double.NEGATIVE_INFINITY, "", null);
+
+        CandidateEvaluator.Evaluation sev = null;
+
+        if (evaluator instanceof MultiCriteriaCandidateEvaluator qev) {
+            sev = qev.evaluateStrict(userText, best.text, context);
+        } else {
+            // fallback: run normal evaluator again (still deterministic)
+            sev = evaluator.evaluate(userText, best.text, context);
+        }
+
+        return Candidate.fromEvaluation(best.text, sev);
+    }
+
+    private static void applyStrictRepairTags(ThoughtState state) {
+        if (state == null) return;
+        if (state.tags == null) state.tags = new HashMap<>(16);
+
+        state.tags.put("repair.verifyFail", "1");
+        state.tags.put("repair.addEvidence", "1");
+        state.tags.put("repair.reduceNovelty", "1");
+        state.tags.put("repair.require_evidence", "true");
+        state.tags.put("repair.forbid_generic", "true");
+        state.tags.put("repair.cite_ids", "true");
+    }
+
+    private static void clearStrictRepairTags(Map<String, String> tags) {
+        if (tags == null) return;
+        tags.remove("repair.verifyFail");
     }
 
     // -------------------- evaluation --------------------
@@ -463,15 +682,15 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
     // -------------------- retrieve -> rerank -> compress --------------------
 
-    private RetrievalBundle retrieveRerankCompress(String userQuery, List<String> baseQueries, long seed) {
+    private RetrievalBundle retrieveRerankCompress(String userQuery, List<String> baseQueries, long seed, int effectiveRetrieveK) {
 
         if (log.isTraceEnabled()) {
-            log.trace("retrieve.start seed={} k={} queries={}", Long.toUnsignedString(seed), retrieveK, baseQueries);
+            log.trace("retrieve.start seed={} k={} queries={}", Long.toUnsignedString(seed), effectiveRetrieveK, baseQueries);
         }
 
         if (retriever instanceof KnowledgeRetriever kr) {
             String joined = String.join("\n", baseQueries);
-            KnowledgeRetriever.Trace tr = kr.retrieveTrace(joined, retrieveK, seed);
+            KnowledgeRetriever.Trace tr = kr.retrieveTrace(joined, effectiveRetrieveK, seed);
 
             List<Statement> selected = (tr.selected == null) ? List.of() : tr.selected;
 
@@ -487,6 +706,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 compressed = compressContextToStatements(userQuery, selected, COMPRESS_SENTENCES, COMPRESS_MAX_CHARS);
             }
 
+            // Note: we still compute our rerank later (hybrid). Here keep trace-provided rerank if present.
             List<Statement> reranked;
             if (tr.rerankedTop != null && !tr.rerankedTop.isEmpty()) {
                 reranked = tr.rerankedTop.stream()
@@ -494,7 +714,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                         .filter(Objects::nonNull)
                         .toList();
             } else {
-                reranked = rerankContext(userQuery, selected, RERANK_N, RERANK_M);
+                reranked = rerankContextOverlap(userQuery, selected, RERANK_N, RERANK_M);
             }
 
             if (log.isDebugEnabled()) {
@@ -506,7 +726,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         }
 
         Map<String, Statement> mergedByKey = new ConcurrentHashMap<>();
-        retrieveAndMerge(baseQueries, mergedByKey, seed);
+        retrieveAndMerge(baseQueries, mergedByKey, seed, effectiveRetrieveK);
 
         for (int r = 0; r < refineRounds; r++) {
             List<Statement> ctxNow = toDeterministicContext(mergedByKey);
@@ -517,11 +737,11 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             }
             if (derived.isEmpty()) break;
 
-            retrieveAndMerge(derived, mergedByKey, mix(seed, 0x9E3779B97F4A7C15L + r));
+            retrieveAndMerge(derived, mergedByKey, mix(seed, 0x9E3779B97F4A7C15L + r), effectiveRetrieveK);
         }
 
         List<Statement> raw = toDeterministicContext(mergedByKey);
-        List<Statement> reranked = rerankContext(userQuery, raw, RERANK_N, RERANK_M);
+        List<Statement> reranked = rerankContextOverlap(userQuery, raw, RERANK_N, RERANK_M);
         List<Statement> compressed = compressContextToStatements(userQuery, reranked, COMPRESS_SENTENCES, COMPRESS_MAX_CHARS);
 
         if (log.isDebugEnabled()) {
@@ -536,9 +756,84 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         return xs == null ? 0 : xs.size();
     }
 
-    // -------------------- rerank --------------------
+    // -------------------- rerank (hybrid) --------------------
 
-    private static List<Statement> rerankContext(String userQuery, List<Statement> raw, int topN, int topM) {
+    private static List<Statement> rerankContextHybrid(
+            String userQuery,
+            List<Statement> raw,
+            int topN,
+            int topM,
+            Map<String, Byte> origin,
+            Map<String, Integer> df,
+            int dfDocs
+    ) {
+        if (raw == null || raw.isEmpty()) return List.of();
+
+        Set<String> qTok = tokens(userQuery);
+        if (qTok.isEmpty()) {
+            return raw.stream()
+                    .sorted(Comparator.comparing(IterativeThoughtEngine::stableStmtKey, Comparator.nullsLast(String::compareTo)))
+                    .limit(Math.max(1, topM))
+                    .toList();
+        }
+
+        int n = Math.min(Math.max(1, topN), raw.size());
+        ArrayList<ScoredStmt> scored = new ArrayList<>(n);
+
+        for (int i = 0; i < n; i++) {
+            Statement s = raw.get(i);
+            if (s == null || s.text == null || s.text.isBlank()) continue;
+
+            String key = stableStmtKey(s);
+
+            double ov = overlapScore(qTok, s.text);
+
+            byte o = (origin == null || key == null) ? 0 : origin.getOrDefault(key, (byte) 0);
+
+            // source prior: retrieval bonus, LTM-only slight penalty
+            double sourceBonus = ((o & 1) != 0) ? 0.08 : 0.0;
+            double ltmPenalty = (o == 2) ? 0.05 : 0.0;
+
+            // DF penalty: too-common tokens (generic statements) sink a bit
+            double dfPenalty = 0.0;
+            if (df != null && dfDocs > 0) {
+                Set<String> stTok = tokens(s.text);
+                int seen = 0;
+                double acc = 0.0;
+                for (String t : stTok) {
+                    Integer c = df.get(t);
+                    if (c != null) {
+                        acc += (double) c / (double) dfDocs;
+                        seen++;
+                    }
+                    if (seen >= 12) break;
+                }
+                if (seen > 0) dfPenalty = acc / seen; // 0..1
+            }
+
+            double score = ov + sourceBonus - ltmPenalty - 0.10 * dfPenalty;
+            scored.add(new ScoredStmt(s, score));
+        }
+
+        scored.sort((a, b) -> {
+            int cmp = Double.compare(b.score, a.score);
+            if (cmp != 0) return cmp;
+            String ka = stableStmtKey(a.stmt);
+            String kb = stableStmtKey(b.stmt);
+            if (ka == null && kb == null) return 0;
+            if (ka == null) return 1;
+            if (kb == null) return -1;
+            return ka.compareTo(kb);
+        });
+
+        int m = Math.min(Math.max(1, topM), scored.size());
+        ArrayList<Statement> out = new ArrayList<>(m);
+        for (int i = 0; i < m; i++) out.add(scored.get(i).stmt);
+        return out;
+    }
+
+    // legacy overlap-only rerank kept (used as fallback before hybrid merge is applied)
+    private static List<Statement> rerankContextOverlap(String userQuery, List<Statement> raw, int topN, int topM) {
         if (raw == null || raw.isEmpty()) return List.of();
 
         Set<String> qTok = tokens(userQuery);
@@ -597,16 +892,59 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         }
     }
 
-    // -------------------- generation --------------------
+    private record DfStats(Map<String, Integer> df, int docs) {}
 
-    private List<String> generateDrafts(String userText, List<Statement> context, ThoughtState state) {
-        if (generator != null) return generator.generateN(userText, context, state, draftsPerIteration);
+    private static DfStats buildDfStats(List<Statement> xs, int maxDocs) {
+        if (xs == null || xs.isEmpty()) return new DfStats(Map.of(), 0);
 
-        ArrayList<String> out = new ArrayList<>(draftsPerIteration);
-        for (int d = 0; d < draftsPerIteration; d++) {
-            state.draftIndex = d;
-            out.add(strategy.generate(userText, context, state));
+        int docs = 0;
+        HashMap<String, Integer> df = new HashMap<>(512);
+
+        for (int i = 0; i < xs.size() && docs < maxDocs; i++) {
+            Statement s = xs.get(i);
+            if (s == null || s.text == null || s.text.isBlank()) continue;
+            docs++;
+            Set<String> st = tokens(s.text);
+            for (String t : st) df.merge(t, 1, Integer::sum);
         }
+
+        return new DfStats(df, docs);
+    }
+
+    // -------------------- generation (deterministic diversity) --------------------
+
+    private List<String> generateDraftsDeterministic(String userText, List<Statement> context, ThoughtState state, long iterSeed) {
+        int need = Math.max(1, draftsPerIteration);
+        ArrayList<String> out = new ArrayList<>(need);
+
+        long savedSeed = state.seed;
+        int savedIdx = state.draftIndex;
+
+        try {
+            state.draftsRequested = need;
+
+            for (int d = 0; d < need; d++) {
+                state.draftIndex = d;
+
+                long draftSeed = mix(iterSeed, 0xD1B54A32D192ED03L ^ (long) d);
+                state.tags.put("gen.draftSeed", Long.toUnsignedString(draftSeed));
+                state.seed = draftSeed;
+
+                if (generator != null) {
+                    // generator will also see state.draftIndex and state.seed
+                    String s = generator.generate(generator.prepareUserText(userText, context, state), context, state);
+                    if (s == null) s = "";
+                    out.add(s);
+                } else {
+                    out.add(strategy.generate(userText, context, state));
+                }
+            }
+        } finally {
+            state.seed = savedSeed;
+            state.draftIndex = savedIdx;
+        }
+
+        if (out.isEmpty()) out.add("");
         return out;
     }
 
@@ -638,11 +976,15 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 .filter(v -> v != null && !v.isBlank())
                 .orElse("md");
 
-        StringBuilder sb = new StringBuilder(256);
+        StringBuilder sb = new StringBuilder(320);
         sb.append("format=").append(style);
         sb.append(";sections=").append(sections);
         sb.append(";intent=").append(Optional.ofNullable(state.intent).orElse(Intent.UNKNOWN).name());
         sb.append(";iter=").append(state.iteration);
+
+        sb.append(";phase=").append(state.phase);
+        sb.append(";div=").append(state.diversity);
+        sb.append(";evs=").append(fmt(state.evidenceStrictness));
 
         Optional.ofNullable(state.lastEvaluation).ifPresent(last -> {
             sb.append(";last_g=").append(fmt(last.groundedness));
@@ -755,6 +1097,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         tags.remove("repair.reduceNovelty");
         tags.remove("repair.fixStructure");
         tags.remove("repair.avoidEcho");
+        // keep verifyFail until strict pass clears it explicitly
     }
 
     private static void appendRepairHint(ThoughtState state, StringBuilder sb) {
@@ -815,12 +1158,12 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
     // -------------------- retrieval fallback helpers --------------------
 
-    private void retrieveAndMerge(List<String> queries, Map<String, Statement> mergedByKey, long seed) {
+    private void retrieveAndMerge(List<String> queries, Map<String, Statement> mergedByKey, long seed, int effectiveRetrieveK) {
         if (queries == null || queries.isEmpty()) return;
         for (int i = 0; i < queries.size(); i++) {
             String q = queries.get(i);
             if (q == null || q.isBlank()) continue;
-            List<Statement> got = retriever.retrieve(q, retrieveK, mix(seed, i));
+            List<Statement> got = retriever.retrieve(q, effectiveRetrieveK, mix(seed, i));
             mergeStatements(got, mergedByKey);
         }
     }
@@ -919,114 +1262,169 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     private static Statement syntheticStatementOrNull(Object o) {
         if (o == null) return null;
         if (o instanceof Statement s) return s;
-        if (o instanceof String str) {
-            if (str.isBlank()) return null;
-            Statement st = new Statement();
-            st.text = str;
-            return st;
-        }
-        return null;
+        String s = o.toString();
+        if (s == null || s.isBlank()) return null;
+        Statement st = new Statement();
+        st.id = "syn";
+        st.text = s.trim();
+        return st;
     }
 
-    // -------------------- LTM --------------------
+    // -------------------- LTM recall / write / decay / promotion --------------------
 
     private List<Statement> recallFromLtm(List<String> queries) {
-        if (ltmByKey.isEmpty() || ltmRecallK <= 0) return List.of();
+        if (!ltmEnabled || ltmByKey.isEmpty() || ltmRecallK <= 0) return List.of();
 
-        Set<String> qTokens = queries.stream()
-                .flatMap(q -> tokens(q).stream())
-                .collect(Collectors.toCollection(LinkedHashSet::new));
+        LinkedHashSet<String> qTokAll = new LinkedHashSet<>();
+        if (queries != null) {
+            for (String q : queries) {
+                Set<String> t = tokens(q);
+                qTokAll.addAll(t);
+                if (qTokAll.size() > 128) break;
+            }
+        }
+        if (qTokAll.isEmpty()) return List.of();
 
-        var all = new ArrayList<>(ltmByKey.entrySet());
-        all.sort((a, b) -> {
-            double sa = recallScore(a.getKey(), a.getValue(), qTokens);
-            double sb = recallScore(b.getKey(), b.getValue(), qTokens);
-            int cmp = Double.compare(sb, sa);
-            return (cmp != 0) ? cmp : a.getKey().compareTo(b.getKey());
+        ArrayList<ScoredKey> scored = new ArrayList<>(Math.min(2048, ltmByKey.size()));
+        long now = ltmTick.get();
+
+        for (var e : ltmByKey.entrySet()) {
+            String key = e.getKey();
+            Statement st = e.getValue();
+            if (key == null || st == null || st.text == null || st.text.isBlank()) continue;
+
+            Set<String> tok = ltmTokensByKey.computeIfAbsent(key, k -> tokens(st.text));
+
+            double ov = overlapScore(qTokAll, tok);
+            if (ov <= 0.0) continue;
+
+            // decay priority over ticks since last touch
+            double pr = ltmPriorityByKey.getOrDefault(key, 0.0);
+            long last = ltmLastTouchTick.getOrDefault(key, 0L);
+            double prEff = clamp01(pr - Math.max(0L, now - last) * ltmDecayPerTick);
+
+            double score = 0.80 * ov + 0.20 * prEff;
+            scored.add(new ScoredKey(key, score));
+        }
+
+        scored.sort((a, b) -> {
+            int c = Double.compare(b.score, a.score);
+            if (c != 0) return c;
+            return a.key.compareTo(b.key);
         });
 
-        int k = Math.min(ltmRecallK, all.size());
+        int k = Math.min(ltmRecallK, scored.size());
         ArrayList<Statement> out = new ArrayList<>(k);
-        for (int i = 0; i < k; i++) out.add(all.get(i).getValue());
+
+        long touch = ltmTick.incrementAndGet();
+        for (int i = 0; i < k; i++) {
+            String key = scored.get(i).key;
+            Statement st = ltmByKey.get(key);
+            if (st != null) out.add(st);
+
+            // mild touch (recall alone shouldn't promote much)
+            ltmLastTouchTick.put(key, touch);
+            ltmPriorityByKey.merge(key, 0.005, Double::sum);
+        }
+
         return out;
     }
 
-    private double recallScore(String key, Statement s, Set<String> qTokens) {
-        if (s == null || s.text == null || s.text.isBlank()) return 0.0;
+    private void promoteLtmOnFreshEvidence(List<Statement> fresh) {
+        if (!ltmEnabled || fresh == null || fresh.isEmpty() || ltmByKey.isEmpty()) return;
 
-        Set<String> st = ltmTokensByKey.computeIfAbsent(key, k -> tokens(s.text));
+        long touch = ltmTick.incrementAndGet();
 
-        int inter = 0;
-        for (String t : qTokens) if (st.contains(t)) inter++;
-
-        double overlap = (st.isEmpty() || qTokens.isEmpty()) ? 0.0 : (double) inter / (double) Math.max(1, qTokens.size());
-        double pr = ltmPriorityByKey.getOrDefault(key, 0.0);
-        return overlap * 0.80 + clamp01(pr) * 0.20;
-    }
-
-    private void maybeWritebackToLtm(Candidate best, List<Statement> ctx) {
-        if (best == null || best.evaluation == null) return;
-        if (!best.evaluation.valid) return;
-        if (best.evaluation.groundedness < ltmWriteMinGroundedness) return;
-        if (ltmCapacity <= 0) return;
-
-        int stored = 0;
-        for (Statement s : ctx) {
-            if (s == null) continue;
+        for (Statement s : fresh) {
             String k = stableStmtKey(s);
             if (k == null) continue;
-
-            ltmByKey.putIfAbsent(k, s);
-            ltmPriorityByKey.merge(k, 0.02, Double::sum);
-
-            if (++stored >= Math.min(12, ctx.size())) break;
+            if (ltmByKey.containsKey(k)) {
+                ltmPriorityByKey.merge(k, ltmPromotionBoost, Double::sum);
+                ltmLastTouchTick.put(k, touch);
+            }
         }
-
-        if (ltmByKey.size() > ltmCapacity) shrinkLtmToCapacity();
     }
 
-    private void shrinkLtmToCapacity() {
-        if (ltmByKey.size() <= ltmCapacity) return;
+    private void maybeWritebackToLtm(Candidate best, List<Statement> context) {
+        if (!ltmEnabled || best == null || best.evaluation == null) return;
+        if (!best.evaluation.valid) return;
+        if (best.evaluation.groundedness < ltmWriteMinGroundedness) return;
+        if (context == null || context.isEmpty()) return;
 
-        ArrayList<String> keys = new ArrayList<>(ltmByKey.keySet());
-        keys.sort((a, b) -> {
-            double pa = ltmPriorityByKey.getOrDefault(a, 0.0);
-            double pb = ltmPriorityByKey.getOrDefault(b, 0.0);
-            int cmp = Double.compare(pa, pb);
-            return (cmp != 0) ? cmp : a.compareTo(b);
+        // Evidence-only write policy: store only statements (not generated text)
+        // and only those that are "useful": we store top context as LTM cache.
+        int add = 0;
+        long touch = ltmTick.incrementAndGet();
+
+        for (Statement st : context) {
+            if (st == null || st.text == null || st.text.isBlank()) continue;
+
+            String key = stableStmtKey(st);
+            if (key == null) continue;
+
+            if (ltmByKey.putIfAbsent(key, st) == null) {
+                add++;
+                ltmTokensByKey.putIfAbsent(key, tokens(st.text));
+            }
+
+            ltmPriorityByKey.merge(key, 0.02, Double::sum);
+            ltmLastTouchTick.put(key, touch);
+
+            // capacity enforcement (best-effort deterministic trim)
+            if (ltmCapacity > 0 && ltmByKey.size() > ltmCapacity) {
+                trimLtmToCapacity();
+            }
+        }
+
+        if (log.isTraceEnabled() && add > 0) {
+            log.trace("ltm.write add={} size={}", add, ltmByKey.size());
+        }
+    }
+
+    private void trimLtmToCapacity() {
+        if (ltmCapacity <= 0) return;
+        int over = ltmByKey.size() - ltmCapacity;
+        if (over <= 0) return;
+
+        // deterministic trim: drop lowest effective priority (priority - decay)
+        long now = ltmTick.get();
+
+        ArrayList<ScoredKey> xs = new ArrayList<>(Math.min(4096, ltmByKey.size()));
+        for (String k : ltmByKey.keySet()) {
+            double pr = ltmPriorityByKey.getOrDefault(k, 0.0);
+            long last = ltmLastTouchTick.getOrDefault(k, 0L);
+            double eff = pr - Math.max(0L, now - last) * ltmDecayPerTick;
+            xs.add(new ScoredKey(k, eff));
+        }
+
+        xs.sort((a, b) -> {
+            int c = Double.compare(a.score, b.score); // ascending (drop lowest)
+            if (c != 0) return c;
+            return a.key.compareTo(b.key);
         });
 
-        int drop = Math.max(0, ltmByKey.size() - ltmCapacity);
+        int drop = Math.min(over, xs.size());
         for (int i = 0; i < drop; i++) {
-            String k = keys.get(i);
+            String k = xs.get(i).key;
             ltmByKey.remove(k);
             ltmPriorityByKey.remove(k);
             ltmTokensByKey.remove(k);
+            ltmLastTouchTick.remove(k);
         }
     }
 
-    // -------------------- candidate picking --------------------
+    private record ScoredKey(String key, double score) {}
 
-    private static Optional<Candidate> pickBest(List<Candidate> evaluated) {
-        if (evaluated == null || evaluated.isEmpty()) return Optional.empty();
-        Candidate best = null;
-        double bestEff = Double.NEGATIVE_INFINITY;
-
-        for (Candidate c : evaluated) {
-            if (c == null) continue;
-            CandidateEvaluator.Evaluation ev = c.evaluation;
-            double eff = (ev != null && ev.isSane()) ? ev.effectiveScore() : c.score;
-            if (best == null || eff > bestEff) {
-                best = c;
-                bestEff = eff;
-            }
-        }
-        return Optional.ofNullable(best);
+    private static double overlapScore(Set<String> qTok, Set<String> tTok) {
+        if (qTok == null || qTok.isEmpty() || tTok == null || tTok.isEmpty()) return 0.0;
+        int inter = 0;
+        for (String t : qTok) if (tTok.contains(t)) inter++;
+        return (double) inter / (double) Math.max(1, qTok.size());
     }
 
-    // -------------------- normalization & tokens --------------------
+    // -------------------- utilities / helpers --------------------
 
-    private String normalizeUserText(String s) {
+    private static String normalizeUserText(String s) {
         if (s == null) return "";
         String x = s.trim();
         if (x.isEmpty()) return "";
@@ -1037,61 +1435,65 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     }
 
     private static boolean isMostlyCyrillic(String s) {
-        if (s == null || s.isBlank()) return true;
-        int cyr = 0, lat = 0;
+        if (s == null || s.isBlank()) return false;
+        int cyr = 0, total = 0;
         for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (Character.UnicodeBlock.of(c) == Character.UnicodeBlock.CYRILLIC) cyr++;
-            else if (Character.UnicodeBlock.of(c) == Character.UnicodeBlock.BASIC_LATIN) lat++;
+            char ch = s.charAt(i);
+            if (!Character.isLetter(ch)) continue;
+            total++;
+            if ((ch >= 'А' && ch <= 'я') || ch == 'ё' || ch == 'Ё') cyr++;
         }
-        return cyr >= lat;
-    }
-
-    private static Set<String> tokens(String text) {
-        if (text == null || text.isBlank()) return Set.of();
-        String s = text.toLowerCase(Locale.ROOT);
-        LinkedHashSet<String> out = new LinkedHashSet<>();
-        java.util.regex.Matcher m = WORD.matcher(s);
-        while (m.find()) {
-            String w = m.group();
-            if (w == null) continue;
-            out.add(w);
-            if (out.size() >= 128) break;
-        }
-        return out;
+        if (total <= 0) return false;
+        return ((double) cyr / (double) total) >= 0.55;
     }
 
     private static int approxQueryTokenCount(String s) {
         if (s == null || s.isBlank()) return 0;
-        int c = 0;
+        int n = 0;
         java.util.regex.Matcher m = WORD.matcher(s.toLowerCase(Locale.ROOT));
         while (m.find()) {
-            c++;
-            if (c >= 256) break;
+            n++;
+            if (n >= 64) break;
         }
-        return c;
+        return n;
+    }
+
+    private static Set<String> tokens(String s) {
+        if (s == null || s.isBlank()) return Set.of();
+        HashSet<String> out = new HashSet<>(64);
+        java.util.regex.Matcher m = WORD.matcher(s.toLowerCase(Locale.ROOT));
+        while (m.find()) {
+            String t = m.group();
+            if (t == null || t.isBlank()) continue;
+            out.add(t);
+            if (out.size() >= 256) break;
+        }
+        return out;
     }
 
     private static String stableStmtKey(Statement s) {
         if (s == null) return null;
-        if (s.id != null && !s.id.isBlank()) return "id:" + s.id.trim();
-        if (s.text == null || s.text.isBlank()) return null;
-        String t = s.text.trim();
-        if (t.length() > 160) t = t.substring(0, 160);
-        return "tx:" + t.toLowerCase(Locale.ROOT);
+        String id = (s.id == null) ? "" : s.id.trim();
+        String txt = (s.text == null) ? "" : s.text.trim();
+        if (id.isEmpty() && txt.isEmpty()) return null;
+        // deterministic key: id + hash(text)
+        long h = fnv1a64(txt);
+        return id + "#" + Long.toUnsignedString(h, 36);
     }
 
-    // -------------------- math/format --------------------
-
-    private static double clamp01(double v) {
-        if (!Double.isFinite(v)) return 0.0;
-        if (v < 0.0) return 0.0;
-        if (v > 1.0) return 1.0;
-        return v;
+    private static long fnv1a64(String s) {
+        if (s == null) return 0L;
+        long h = 0xcbf29ce484222325L;
+        for (int i = 0; i < s.length(); i++) {
+            h ^= (byte) s.charAt(i);
+            h *= 0x100000001b3L;
+        }
+        return h;
     }
 
     private static long mix(long a, long b) {
-        long x = a ^ (b * 0x9E3779B97F4A7C15L);
+        long x = a + 0x9E3779B97F4A7C15L;
+        x ^= b + 0xBF58476D1CE4E5B9L;
         x ^= (x >>> 30);
         x *= 0xBF58476D1CE4E5B9L;
         x ^= (x >>> 27);
@@ -1100,201 +1502,130 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         return x;
     }
 
-    private static String fmt(double v) {
-        if (!Double.isFinite(v)) return "0";
-        return String.format(Locale.ROOT, "%.4f", v);
+    private static double clamp01(double v) {
+        if (!Double.isFinite(v)) return 0.0;
+        if (v < 0.0) return 0.0;
+        if (v > 1.0) return 1.0;
+        return v;
     }
 
-    // =====================================================================
-    // Extra logging helpers (safe, non-heavy)
-    // =====================================================================
+    private static String fmt(double v) {
+        return String.format(Locale.ROOT, "%.3f", v);
+    }
 
     private static String preview(String s, int max) {
         if (s == null) return "";
-        String x = s.replace("\n", "\\n").replace("\r", "\\r").trim();
+        String x = s.replace('\n', ' ').replace('\r', ' ').trim();
         if (x.length() <= max) return x;
         return x.substring(0, Math.max(0, max - 1)) + "…";
     }
 
-    private static String previewContext(List<Statement> ctx, int n, int perItemMax) {
-        if (ctx == null || ctx.isEmpty()) return "[]";
-        int k = Math.min(n, ctx.size());
-        StringBuilder sb = new StringBuilder(512);
-        sb.append("[");
-        for (int i = 0; i < k; i++) {
-            Statement s = ctx.get(i);
-            if (i > 0) sb.append(", ");
-            sb.append("{k=").append(stableStmtKey(s)).append(", t=").append(preview(s == null ? "" : s.text, perItemMax)).append("}");
-        }
-        if (ctx.size() > k) sb.append(", … +").append(ctx.size() - k);
-        sb.append("]");
-        return sb.toString();
-    }
-
-    private static String previewList(List<String> xs, int n, int perItemMax) {
+    private static String previewList(List<String> xs, int n, int maxEach) {
         if (xs == null || xs.isEmpty()) return "[]";
         int k = Math.min(n, xs.size());
-        StringBuilder sb = new StringBuilder(512);
-        sb.append("[");
-        for (int i = 0; i < k; i++) {
-            if (i > 0) sb.append(", ");
-            sb.append("'").append(preview(xs.get(i), perItemMax)).append("'");
-        }
-        if (xs.size() > k) sb.append(", … +").append(xs.size() - k);
-        sb.append("]");
-        return sb.toString();
+        ArrayList<String> out = new ArrayList<>(k);
+        for (int i = 0; i < k; i++) out.add("'" + preview(xs.get(i), maxEach) + "'");
+        return out.toString();
     }
 
-    private static String topCandidatesSummary(List<Candidate> evaluated, int n) {
-        if (evaluated == null || evaluated.isEmpty()) return "[]";
-        ArrayList<Candidate> xs = new ArrayList<>(evaluated);
-        xs.sort((a, b) -> Double.compare(
-                b == null ? Double.NEGATIVE_INFINITY : b.score,
-                a == null ? Double.NEGATIVE_INFINITY : a.score));
-
-        int k = Math.min(n, xs.size());
-        StringBuilder sb = new StringBuilder(256);
-        sb.append("[");
+    private static String previewContext(List<Statement> ctx, int n, int maxEach) {
+        if (ctx == null || ctx.isEmpty()) return "[]";
+        int k = Math.min(n, ctx.size());
+        ArrayList<String> out = new ArrayList<>(k);
         for (int i = 0; i < k; i++) {
-            Candidate c = xs.get(i);
-            if (i > 0) sb.append(", ");
-            CandidateEvaluator.Evaluation ev = (c == null) ? null : c.evaluation;
-
-            sb.append("{s=").append(fmt(c == null ? 0 : c.score))
-                    .append(", eff=").append(fmt(ev == null ? 0.0 : ev.effectiveScore()))
-                    .append(", v=").append(ev != null && ev.valid ? 1 : 0)
-                    .append(", g=").append(ev == null ? "0" : fmt(ev.groundedness))
-                    .append(", cs=").append(ev == null ? "0" : fmt(ev.contextSupport))
-                    .append(", cov=").append(ev == null ? "0" : fmt(ev.coverage))
-                    .append(", st=").append(ev == null ? "0" : fmt(ev.structureScore))
-                    .append(", r=").append(ev == null ? "0" : fmt(ev.contradictionRisk))
-                    .append("}");
+            Statement s = ctx.get(i);
+            out.add("#" + i + ":" + preview(s == null ? "" : s.text, maxEach));
         }
-        if (xs.size() > k) sb.append(", … +").append(xs.size() - k);
-        sb.append("]");
-        return sb.toString();
+        return out.toString();
     }
 
-    private static Map<String, String> stableSmallMap(Map<String, String> in, int maxKeys) {
-        if (in == null || in.isEmpty()) return Map.of();
-        ArrayList<String> ks = new ArrayList<>(in.keySet());
-        ks.sort(String::compareTo);
-        int k = Math.min(maxKeys, ks.size());
-        LinkedHashMap<String, String> out = new LinkedHashMap<>(k);
-        for (int i = 0; i < k; i++) {
-            String key = ks.get(i);
-            out.put(key, in.get(key));
+    private static Map<String, String> stableSmallMap(Map<String, String> m, int maxKeys) {
+        if (m == null || m.isEmpty()) return Map.of();
+        ArrayList<String> keys = new ArrayList<>(m.keySet());
+        keys.sort(String::compareTo);
+        LinkedHashMap<String, String> out = new LinkedHashMap<>();
+        int n = 0;
+        for (String k : keys) {
+            out.put(k, m.get(k));
+            n++;
+            if (n >= maxKeys) break;
         }
-        if (ks.size() > k) out.put("…", "+" + (ks.size() - k) + " keys");
         return out;
     }
 
-    // =====================================================================
-    // Internal helpers (no hardcode responses)
-    // =====================================================================
-
-    private static final class Drafts {
-        private Drafts() {}
-
-        static List<String> sanitize(List<String> drafts, int minCount) {
-            if (drafts == null || drafts.isEmpty()) return List.of();
-
-            LinkedHashSet<String> set = new LinkedHashSet<>();
-            for (String d : drafts) {
-                if (d == null) continue;
-                String s = d.trim();
-                if (s.isEmpty()) continue;
-                set.add(s);
-            }
-
-            if (set.isEmpty()) return List.of();
-
-            ArrayList<String> out = new ArrayList<>(set);
-
-            int target = Math.max(2, Math.min(Math.max(2, minCount), 12));
-            if (out.size() >= target) return out;
-
-            int i = 0;
-            while (out.size() < target && out.size() < 64) {
-                out.add(out.get(i % out.size()));
-                i++;
-                if (i > 256) break;
-            }
-            return out;
+    private static Optional<Candidate> pickBest(List<Candidate> xs) {
+        if (xs == null || xs.isEmpty()) return Optional.empty();
+        Candidate best = null;
+        for (Candidate c : xs) {
+            if (c == null) continue;
+            if (best == null || c.score > best.score) best = c;
         }
+        return Optional.ofNullable(best);
     }
 
-    private static final class RetrievalBundle {
-        final List<Statement> rawEvidence;
-        final List<Statement> rerankedContext;
-        final List<Statement> compressedContext;
-        final Double traceQuality;
-
-        RetrievalBundle(List<Statement> rawEvidence, List<Statement> rerankedContext, List<Statement> compressedContext, Double traceQuality) {
-            this.rawEvidence = rawEvidence == null ? List.of() : rawEvidence;
-            this.rerankedContext = rerankedContext == null ? List.of() : rerankedContext;
-            this.compressedContext = compressedContext == null ? List.of() : compressedContext;
-            this.traceQuality = traceQuality;
+    private static String topCandidatesSummary(List<Candidate> xs, int k) {
+        if (xs == null || xs.isEmpty()) return "[]";
+        ArrayList<Candidate> copy = new ArrayList<>(xs);
+        copy.sort((a, b) -> Double.compare(b.score, a.score));
+        int n = Math.min(Math.max(1, k), copy.size());
+        ArrayList<String> out = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
+            Candidate c = copy.get(i);
+            CandidateEvaluator.Evaluation ev = c == null ? null : c.evaluation;
+            out.add("{" + i + " s=" + fmt(c.score)
+                    + " v=" + (ev != null && ev.valid ? 1 : 0)
+                    + " g=" + (ev == null ? "0" : fmt(ev.groundedness))
+                    + " cs=" + (ev == null ? "0" : fmt(ev.contextSupport))
+                    + " st=" + (ev == null ? "0" : fmt(ev.structureScore))
+                    + " r=" + (ev == null ? "0" : fmt(ev.contradictionRisk))
+                    + "}");
         }
-
-        RetrievalBundle withMerged(List<Statement> raw, List<Statement> reranked, List<Statement> compressed) {
-            return new RetrievalBundle(raw, reranked, compressed, traceQuality);
-        }
+        return out.toString();
     }
+
+    // -------------------- QueryProvider / StopRule / RetrievalBundle --------------------
 
     private interface QueryProvider {
         List<String> queries(String userText, ThoughtState state);
 
         static QueryProvider userText() {
-            return (userText, state) -> {
-                if (userText == null || userText.isBlank()) return List.of();
-                return List.of(userText.trim());
-            };
+            return (u, s) -> List.of(u == null ? "" : u.trim());
         }
 
         static QueryProvider intentName() {
-            return (userText, state) -> {
-                Intent it = (state == null) ? null : state.intent;
-                if (it == null) return List.of();
-                if (it == Intent.UNKNOWN) return List.of(); // FIX: do not poison retrieval
-                String name = it.name();
-                if (name == null || name.isBlank()) return List.of();
-                return List.of(name);
+            return (u, s) -> {
+                Intent it = (s == null) ? Intent.UNKNOWN : s.intent;
+                if (it == null || it == Intent.UNKNOWN) return List.of();
+                return List.of(it.name().toLowerCase(Locale.ROOT));
             };
         }
 
-        static QueryProvider bestTerms(int maxTerms, int minBestScoreTokens) {
-            final int mt = Math.max(1, maxTerms);
-            return (userText, state) -> {
-                Candidate best = (state == null) ? null : state.bestSoFar;
-                CandidateEvaluator.Evaluation ev = (state == null) ? null : state.bestEvaluation;
+        static QueryProvider bestTerms(int maxTerms, int minLen) {
+            return (u, s) -> {
+                if (s == null || s.bestEvaluation == null || s.bestSoFar == null) return List.of();
+                if (!s.bestEvaluation.valid) return List.of();
+                if (s.bestEvaluation.groundedness < 0.45) return List.of();
 
-                // FIX: don't derive from bad/invalid bestSoFar
-                if (best == null || best.text == null || best.text.isBlank()) return List.of();
-                if (ev == null || !ev.valid) return List.of();
-
-                Set<String> tok = tokens(best.text);
-                if (tok.size() < Math.max(3, minBestScoreTokens)) return List.of();
-
-                ArrayList<String> out = new ArrayList<>(Math.min(mt, tok.size()));
-                int i = 0;
-                for (String t : tok) {
-                    if (t.length() < 4) continue;
-                    out.add(t);
-                    if (++i >= mt) break;
+                Set<String> t = tokens(s.bestSoFar.text);
+                ArrayList<String> out = new ArrayList<>(Math.min(maxTerms, t.size()));
+                for (String x : t) {
+                    if (x.length() >= minLen) out.add(x);
                 }
+                out.sort(String::compareTo);
+                if (out.size() > maxTerms) return out.subList(0, maxTerms);
                 return out;
             };
         }
     }
 
     private interface StopRule {
-        boolean shouldStop(ThoughtState state, Candidate globalBest, int stagnation);
-        default String name() { return getClass().getSimpleName(); }
+        boolean shouldStop(ThoughtState state, Candidate best, int stagnation);
+
+        String name();
 
         static StopRule targetScore(double target) {
             return new StopRule() {
-                @Override public boolean shouldStop(ThoughtState state, Candidate best, int stg) {
+                @Override public boolean shouldStop(ThoughtState state, Candidate best, int stagnation) {
                     return best != null && best.score >= target;
                 }
                 @Override public String name() { return "targetScore"; }
@@ -1302,13 +1633,48 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         }
 
         static StopRule patience(int patience) {
-            final int p = Math.max(0, patience);
             return new StopRule() {
-                @Override public boolean shouldStop(ThoughtState state, Candidate best, int stg) {
-                    return stg > p;
+                @Override public boolean shouldStop(ThoughtState state, Candidate best, int stagnation) {
+                    return patience > 0 && stagnation >= patience;
                 }
                 @Override public String name() { return "patience"; }
             };
+        }
+    }
+
+    private record RetrievalBundle(
+            List<Statement> rawEvidence,
+            List<Statement> rerankedContext,
+            List<Statement> compressedContext,
+            Double traceQuality
+    ) {
+        RetrievalBundle withMerged(List<Statement> merged, List<Statement> reranked, List<Statement> compressed) {
+            return new RetrievalBundle(merged, reranked, compressed, traceQuality);
+        }
+    }
+
+    // -------------------- Drafts helper --------------------
+
+    private static final class Drafts {
+        private Drafts() {}
+
+        static List<String> sanitize(List<String> drafts, int want) {
+            if (drafts == null || drafts.isEmpty()) return List.of("");
+
+            LinkedHashSet<String> uniq = new LinkedHashSet<>();
+            for (String s : drafts) {
+                String x = (s == null) ? "" : s.trim();
+                if (x.isEmpty()) continue;
+                uniq.add(x);
+            }
+
+            ArrayList<String> out = new ArrayList<>(uniq);
+            if (out.isEmpty()) out.add("");
+
+            // keep at least 2..4 (avoid collapse), but respect want as upper bound
+            int cap = Math.max(2, Math.min(want, Math.max(4, out.size())));
+            if (out.size() > cap) out = new ArrayList<>(out.subList(0, cap));
+            return out;
         }
     }
 }

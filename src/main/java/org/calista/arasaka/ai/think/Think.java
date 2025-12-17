@@ -1,13 +1,12 @@
+// FILE: Think.java
 package org.calista.arasaka.ai.think;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.calista.arasaka.ai.retrieve.retriver.Retriever;
-import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
-import org.calista.arasaka.ai.think.candidate.impl.AdvancedCandidateEvaluator;
+import org.calista.arasaka.ai.think.candidate.impl.CandidateEvaluator;
 import org.calista.arasaka.ai.think.engine.impl.IterativeThoughtEngine;
-import org.calista.arasaka.ai.think.intent.IntentDetector;
-import org.calista.arasaka.ai.think.intent.impl.AdvancedIntentDetector;
+import org.calista.arasaka.ai.think.intent.impl.IntentDetector;
 import org.calista.arasaka.ai.think.response.ContextAnswerStrategy;
 import org.calista.arasaka.ai.think.response.ResponseStrategy;
 import org.calista.arasaka.ai.think.textGenerator.TextGenerator;
@@ -24,6 +23,10 @@ import java.util.function.LongSupplier;
  *
  * Ownership change:
  *  - Think владеет evalExecutor (создание/закрытие), engine только использует его.
+ *
+ * Enterprise change:
+ *  - prod default: AdvancedIntentDetector autoBootstrap=false (no hardcode),
+ *    bootstrap allowed only in dev profile.
  */
 public final class Think implements AutoCloseable {
 
@@ -33,9 +36,9 @@ public final class Think implements AutoCloseable {
 
     private final Retriever retriever;
     private final Tokenizer tokenizer;
-    private final IntentDetector intentDetector;
+    private final org.calista.arasaka.ai.think.intent.IntentDetector intentDetector;
     private final ResponseStrategy responseStrategy;
-    private final CandidateEvaluator evaluator;
+    private final org.calista.arasaka.ai.think.candidate.CandidateEvaluator evaluator;
     private final TextGenerator generator; // nullable
 
     private final LongSupplier seedProvider;
@@ -50,16 +53,23 @@ public final class Think implements AutoCloseable {
     private Think(Builder b) {
         this.retriever = Objects.requireNonNull(b.retriever, "retriever");
         this.tokenizer = Objects.requireNonNull(b.tokenizer, "tokenizer");
+
+        this.config = Objects.requireNonNull(b.config, "config").freezeAndValidate();
+
+        // INTENTS: prod default => autoBootstrap=false
         this.intentDetector = (b.intentDetector != null)
                 ? b.intentDetector
-                : new AdvancedIntentDetector(AdvancedIntentDetector.Config.builder().build());
+                : new IntentDetector(
+                IntentDetector.Config.builder()
+                        .autoBootstrap(config.devMode) // devMode=true => bootstrap on; prod => off
+                        .build()
+        );
 
         this.responseStrategy = (b.responseStrategy != null) ? b.responseStrategy : new ContextAnswerStrategy();
         this.generator = b.generator;
 
-        this.evaluator = (b.evaluator != null) ? b.evaluator : new AdvancedCandidateEvaluator(tokenizer);
+        this.evaluator = (b.evaluator != null) ? b.evaluator : new CandidateEvaluator(tokenizer);
 
-        this.config = b.config.freezeAndValidate();
         this.seedProvider = (b.seedProvider != null) ? b.seedProvider : defaultSeedProvider(b.clock);
 
         // IMPORTANT: ownership rule for JAR/DI usage
@@ -84,7 +94,15 @@ public final class Think implements AutoCloseable {
                 config.ltmRecallK,
                 config.ltmWriteMinGroundedness,
                 config.refineRounds,
-                config.refineQueryBudget
+                config.refineQueryBudget,
+                // new knobs:
+                config.exploreIters,
+                config.exploreRetrieveKMult,
+                config.exploitEvidenceStrictness,
+                config.strictVerifyEnabled,
+                config.strictVerifyMinScore,
+                config.ltmDecayPerTick,
+                config.ltmPromotionBoost
         );
 
         logCreation();
@@ -114,11 +132,11 @@ public final class Think implements AutoCloseable {
 
     public Tokenizer getTokenizer() { return tokenizer; }
 
-    public IntentDetector getIntentDetector() { return intentDetector; }
+    public org.calista.arasaka.ai.think.intent.IntentDetector getIntentDetector() { return intentDetector; }
 
     public ResponseStrategy getResponseStrategy() { return responseStrategy; }
 
-    public CandidateEvaluator getEvaluator() { return evaluator; }
+    public org.calista.arasaka.ai.think.candidate.CandidateEvaluator getEvaluator() { return evaluator; }
 
     public TextGenerator getGenerator() { return generator; }
 
@@ -152,9 +170,9 @@ public final class Think implements AutoCloseable {
         private final Retriever retriever;
         private final Tokenizer tokenizer;
 
-        private IntentDetector intentDetector;
+        private org.calista.arasaka.ai.think.intent.IntentDetector intentDetector;
         private ResponseStrategy responseStrategy;
-        private CandidateEvaluator evaluator;
+        private org.calista.arasaka.ai.think.candidate.CandidateEvaluator evaluator;
         private TextGenerator generator;
 
         private LongSupplier seedProvider;
@@ -175,7 +193,7 @@ public final class Think implements AutoCloseable {
             return this;
         }
 
-        public Builder intentDetector(IntentDetector detector) {
+        public Builder intentDetector(org.calista.arasaka.ai.think.intent.IntentDetector detector) {
             this.intentDetector = Objects.requireNonNull(detector, "intentDetector");
             return this;
         }
@@ -185,7 +203,7 @@ public final class Think implements AutoCloseable {
             return this;
         }
 
-        public Builder evaluator(CandidateEvaluator evaluator) {
+        public Builder evaluator(org.calista.arasaka.ai.think.candidate.CandidateEvaluator evaluator) {
             this.evaluator = Objects.requireNonNull(evaluator, "evaluator");
             return this;
         }
@@ -218,13 +236,17 @@ public final class Think implements AutoCloseable {
 
         public Builder aggressive() { this.config = Config.aggressive(); return this; }
 
-        public Think build() { return new Think(this); }
+        public Builder dev() { this.config = Config.dev(); return this; }
+
+        public Think build() {
+            return new Think(this);
+        }
     }
 
-    /**
-     * Stable config as part of JAR-public API.
-     */
     public static final class Config {
+        // profile
+        public boolean devMode = false; // prod default
+
         // thinking loop
         public int iterations = 4;
         public int retrieveK = 24;
@@ -235,6 +257,19 @@ public final class Think implements AutoCloseable {
         // refinement
         public int refineRounds = 1;
         public int refineQueryBudget = 16;
+
+        // 3.1 Explore/Exploit knobs
+        public int exploreIters = 2;
+        public double exploreRetrieveKMult = 1.5;
+        public double exploitEvidenceStrictness = 0.78;
+
+        // 3.2 strict verify-pass
+        public boolean strictVerifyEnabled = true;
+        public double strictVerifyMinScore = 0.62;
+
+        // 3.6 LTM self-regulation
+        public double ltmDecayPerTick = 0.0015;
+        public double ltmPromotionBoost = 0.06;
 
         // LTM
         public boolean ltmEnabled = true;
@@ -261,12 +296,30 @@ public final class Think implements AutoCloseable {
             c.targetScore = 0.72;
             c.refineRounds = 2;
             c.refineQueryBudget = 24;
+
+            c.exploreIters = 2;
+            c.exploreRetrieveKMult = 1.7;
+            c.exploitEvidenceStrictness = 0.82;
+
+            c.strictVerifyEnabled = true;
+            c.strictVerifyMinScore = 0.66;
+
             c.ltmEnabled = true;
             c.ltmRecallK = 96;
             c.ltmWriteMinGroundedness = 0.60;
 
             c.evalParallelism = Math.max(2, Math.min(12, Runtime.getRuntime().availableProcessors()));
             c.evalQueueCapacity = 8192;
+            return c;
+        }
+
+        /** Dev profile: bootstrap intents enabled, slightly looser loops (optional). */
+        public static Config dev() {
+            Config c = new Config();
+            c.devMode = true;
+            c.strictVerifyEnabled = true;
+            c.strictVerifyMinScore = 0.58;
+            c.exploitEvidenceStrictness = 0.74;
             return c;
         }
 
@@ -281,9 +334,18 @@ public final class Think implements AutoCloseable {
             refineRounds = Math.max(0, refineRounds);
             refineQueryBudget = Math.max(1, refineQueryBudget);
 
+            exploreIters = Math.max(0, exploreIters);
+            if (exploreRetrieveKMult < 1.0) exploreRetrieveKMult = 1.0;
+            exploitEvidenceStrictness = clamp01(exploitEvidenceStrictness);
+
+            strictVerifyMinScore = Math.max(-10, Math.min(10, strictVerifyMinScore));
+
             ltmCapacity = Math.max(0, ltmCapacity);
             ltmRecallK = Math.max(0, ltmRecallK);
             ltmWriteMinGroundedness = clamp01(ltmWriteMinGroundedness);
+
+            if (ltmDecayPerTick < 0) ltmDecayPerTick = 0.0;
+            if (ltmPromotionBoost < 0) ltmPromotionBoost = 0.0;
 
             evalParallelism = Math.max(1, evalParallelism);
             evalQueueCapacity = Math.max(32, evalQueueCapacity);
@@ -364,6 +426,7 @@ public final class Think implements AutoCloseable {
             b.kv("generator", (generator == null) ? "<none>" : generator.getClass().getName());
             b.kv("engine", engine.getClass().getName());
             b.sep();
+            b.kv("devMode", config.devMode);
             b.kv("iterations", config.iterations);
             b.kv("retrieveK", config.retrieveK);
             b.kv("draftsPerIteration", config.draftsPerIteration);
@@ -372,10 +435,18 @@ public final class Think implements AutoCloseable {
             b.kv("refineRounds", config.refineRounds);
             b.kv("refineQueryBudget", config.refineQueryBudget);
             b.sep();
+            b.kv("exploreIters", config.exploreIters);
+            b.kv("exploreRetrieveKMult", config.exploreRetrieveKMult);
+            b.kv("exploitEvidenceStrictness", config.exploitEvidenceStrictness);
+            b.kv("strictVerifyEnabled", config.strictVerifyEnabled);
+            b.kv("strictVerifyMinScore", config.strictVerifyMinScore);
+            b.sep();
             b.kv("ltmEnabled", config.ltmEnabled);
             b.kv("ltmCapacity", config.ltmCapacity);
             b.kv("ltmRecallK", config.ltmRecallK);
             b.kv("ltmWriteMinGroundedness", config.ltmWriteMinGroundedness);
+            b.kv("ltmDecayPerTick", config.ltmDecayPerTick);
+            b.kv("ltmPromotionBoost", config.ltmPromotionBoost);
             b.sep();
             b.kv("evalParallelism", config.evalParallelism);
             b.kv("evalQueueCapacity", config.evalQueueCapacity);

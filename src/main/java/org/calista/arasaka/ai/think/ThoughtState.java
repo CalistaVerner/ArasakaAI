@@ -34,6 +34,20 @@ public final class ThoughtState {
     public int draftIndex = 0;
 
     /**
+     * Optional per-iteration plan (engine -> generator). Mirrors encoded fields in generationHint.
+     * These are NOT required by all generators, but allow strong backends to avoid re-parsing strings.
+     */
+    public int draftsRequested = 1;
+    public int phase = 0; // CandidateControlSignals.Phase ordinal
+    public int diversity = 1; // CandidateControlSignals.Diversity ordinal
+    public int beamWidth = 12;
+    public int maxTokens = 96;
+    public double evidenceStrictness = 0.65;
+    public boolean requireSections = true;
+    public boolean forbidGeneric = true;
+
+
+    /**
      * Light hint for generation (contract/constraints), NOT hard-coded domain rules.
      * Think of it as telemetry tokens for BeamSearch/TensorFlow (parseable, stable).
      */

@@ -59,6 +59,100 @@ public final class CandidateControlSignals {
         return String.format(Locale.ROOT, "%.2f", v);
     }
 
+
+    // -------------------- structured planning (engine -> generator) --------------------
+
+    /**
+     * Phase of the thinking loop. Encoded into generationHint (retrieval-safe).
+     */
+    public enum Phase {
+        EXPLORE,   // widen search, more drafts, more diversity
+        EXPLOIT,   // tighten, improve bestSoFar
+        VERIFY,    // strict verification pass
+        REPAIR     // focused fix based on critique
+    }
+
+    /**
+     * Deterministic diversity level (NOT randomness).
+     */
+    public enum Diversity {
+        LOW, MEDIUM, HIGH
+    }
+
+    /**
+     * Retrieval-safe plan (no free-form text). Intended to be embedded into ThoughtState.generationHint.
+     *
+     * <p>Encoding is compact and parseable:
+     * phase/diversity are encoded as small ints, booleans as 0/1.</p>
+     */
+    public static final class Plan {
+        public final Phase phase;
+        public final Diversity diversity;
+        public final long seed;
+        public final int drafts;
+        public final int beamWidth;
+        public final int maxTokens;
+
+        /** 0..1 how hard we require grounding on evidence. */
+        public final double evidenceStrictness;
+
+        /** 1 => enforce sectioned answer according to response.sections. */
+        public final boolean requireSections;
+
+        /** 1 => discourage generic filler. */
+        public final boolean forbidGeneric;
+
+        private Plan(Phase phase,
+                     Diversity diversity,
+                     long seed,
+                     int drafts,
+                     int beamWidth,
+                     int maxTokens,
+                     double evidenceStrictness,
+                     boolean requireSections,
+                     boolean forbidGeneric) {
+            this.phase = phase == null ? Phase.EXPLORE : phase;
+            this.diversity = diversity == null ? Diversity.MEDIUM : diversity;
+            this.seed = seed;
+            this.drafts = Math.max(1, drafts);
+            this.beamWidth = Math.max(1, beamWidth);
+            this.maxTokens = Math.max(16, maxTokens);
+            this.evidenceStrictness = clamp01(evidenceStrictness);
+            this.requireSections = requireSections;
+            this.forbidGeneric = forbidGeneric;
+        }
+
+        public static Plan of(Phase phase,
+                              Diversity diversity,
+                              long seed,
+                              int drafts,
+                              int beamWidth,
+                              int maxTokens,
+                              double evidenceStrictness,
+                              boolean requireSections,
+                              boolean forbidGeneric) {
+            return new Plan(phase, diversity, seed, drafts, beamWidth, maxTokens, evidenceStrictness, requireSections, forbidGeneric);
+        }
+
+        /**
+         * Embed into generationHint. Retrieval-safe (numbers only).
+         */
+        public String toHintString() {
+            // NOTE: keep it numeric-only; parsers can map ints back to enums if needed.
+            int p = phase.ordinal();
+            int d = diversity.ordinal();
+            return "phase=" + p +
+                    ";div=" + d +
+                    ";seed=" + seed +
+                    ";drafts=" + drafts +
+                    ";beam=" + beamWidth +
+                    ";maxTok=" + maxTokens +
+                    ";evs=" + fmt2(evidenceStrictness) +
+                    ";reqSec=" + (requireSections ? 1 : 0) +
+                    ";noGen=" + (forbidGeneric ? 1 : 0);
+        }
+    }
+
     private static String fmt2(double v) {
         if (!Double.isFinite(v)) return "0.00";
         double x = Math.round(v * 100.0) / 100.0;

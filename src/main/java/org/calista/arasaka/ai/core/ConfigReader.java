@@ -22,6 +22,7 @@ import java.util.*;
  *
  * No magic: defaults come from AIConfig field initializers + AIConfig.validate() normalization.
  */
+@Deprecated
 public final class ConfigReader {
 
     private static final Logger log = LoggerFactory.getLogger(ConfigReader.class);

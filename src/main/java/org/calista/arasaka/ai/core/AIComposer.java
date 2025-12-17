@@ -12,8 +12,7 @@ import org.calista.arasaka.ai.think.response.ResponseStrategy;
 import org.calista.arasaka.ai.think.Think;
 import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.think.candidate.impl.MultiCriteriaCandidateEvaluator;
-import org.calista.arasaka.ai.think.intent.IntentDetector;
-import org.calista.arasaka.ai.think.intent.impl.AdvancedIntentDetector;
+import org.calista.arasaka.ai.think.intent.impl.IntentDetector;
 import org.calista.arasaka.ai.think.textGenerator.TextGenerator;
 import org.calista.arasaka.ai.think.textGenerator.impl.BigramBeamTextGenerator;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
@@ -105,7 +104,7 @@ public final class AIComposer {
                 12
         );
 
-        IntentDetector intentDetector = new AdvancedIntentDetector();
+        org.calista.arasaka.ai.think.intent.IntentDetector intentDetector = new IntentDetector();
         CandidateEvaluator evaluator = new MultiCriteriaCandidateEvaluator(tokenizer);
         ResponseStrategy strategy = new ContextAnswerStrategy();
         TextGenerator generator = new BigramBeamTextGenerator(tokenizer);

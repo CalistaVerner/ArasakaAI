@@ -2,7 +2,6 @@ package org.calista.arasaka.ai.think.candidate.impl;
 
 import org.calista.arasaka.ai.knowledge.Statement;
 import org.calista.arasaka.ai.retrieve.scorer.impl.TokenOverlapScorer;
-import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
 
 import java.util.*;
@@ -28,7 +27,7 @@ import java.util.regex.Pattern;
  *  - When context is empty, do NOT punish groundedness/novelty harshly.
  *  - Instead punish echoing the question and repetition. This fixes the "Кто ты?" -> "Кто ты?" loop.
  */
-public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
+public final class CandidateEvaluator implements org.calista.arasaka.ai.think.candidate.CandidateEvaluator {
 
     // --- policy thresholds (tunable) ---
     private final double minGroundedness;
@@ -55,7 +54,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
 
     private static final Pattern BULLETISH = Pattern.compile("(?m)^\\s*([-*•]|\\d+\\.|\\d+\\))\\s+");
 
-    public AdvancedCandidateEvaluator(Tokenizer tokenizer) {
+    public CandidateEvaluator(Tokenizer tokenizer) {
         this(
                 tokenizer,
                 new TokenOverlapScorer(Objects.requireNonNull(tokenizer, "tokenizer")),
@@ -69,7 +68,7 @@ public final class AdvancedCandidateEvaluator implements CandidateEvaluator {
         );
     }
 
-    public AdvancedCandidateEvaluator(
+    public CandidateEvaluator(
             Tokenizer tokenizer,
             TokenOverlapScorer overlapScorer,
             double minGroundedness,
