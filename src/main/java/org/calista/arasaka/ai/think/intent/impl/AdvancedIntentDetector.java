@@ -16,15 +16,17 @@ import java.util.stream.Collectors;
  * Advanced deterministic intent detector.
  *
  * Goals:
- * - zero "magic regex rules" for specific intents (policy lives in weights)
  * - stable + debuggable scoring (logs + explanations)
- * - better robustness than SimpleIntentDetector:
+ * - robustness:
  *   - unicode normalization, latin/cyrillic safety
  *   - token + bigram phrase features
  *   - cheap punctuation/shape signals as configurable feature weights (NOT hard-coded to intents)
- *   - score normalization + margin-based confidence (prevents accidental triggers)
+ *   - score normalization + margin-based confidence
  *
- * Still deterministic and tunable via constructor config.
+ * IMPORTANT:
+ * - If no weights are provided, detector would always return UNKNOWN.
+ *   To keep system usable out-of-the-box, we can install a tiny RU/EN bootstrap (autoBootstrap=true).
+ *   For strict “no hardcode” production, set autoBootstrap=false and inject weights from corpora/LTM/config.
  */
 public final class AdvancedIntentDetector implements IntentDetector {
     private static final Logger log = LogManager.getLogger(AdvancedIntentDetector.class);
@@ -34,7 +36,7 @@ public final class AdvancedIntentDetector implements IntentDetector {
     private static final int MAX_TOKENS = 160;
     private static final int MAX_FEATURES = 256;
 
-    /** Per-intent feature weights. Keys are features like: "tok:привет", "bg:добрый_день", "sig:qm", ... */
+    /** Per-intent feature weights. Keys: "tok:привет", "bg:добрый_день", "sig:qm", ... */
     private final EnumMap<Intent, Map<String, Double>> weights;
 
     /** Optional intent priors (bias). Example: QUESTION -> 0.05 */
@@ -47,13 +49,16 @@ public final class AdvancedIntentDetector implements IntentDetector {
     /** Normalization knobs */
     private final double lengthNormPow;     // 0..1 ; 0 disables
     private final boolean useBigrams;
-    private final boolean uniqueTokens;     // set=true reproduces old behavior; false uses counts
+    private final boolean uniqueTokens;     // true: unique set; false uses counts
 
     /** Debug */
     private final boolean debugLog;
 
     /** Optional adaptive graph (learned delta weights). Default = null (fully static). */
     private final NeuronGraph neuronGraph;
+
+    /** If true and no weights are provided, installs a tiny language bootstrap. */
+    private final boolean autoBootstrap;
 
     public AdvancedIntentDetector() {
         this(Config.builder().build(), null);
@@ -90,7 +95,18 @@ public final class AdvancedIntentDetector implements IntentDetector {
 
         this.debugLog = cfg.debugLog;
 
+        this.autoBootstrap = cfg.autoBootstrap;
+
         this.neuronGraph = neuronGraph;
+
+        // Out-of-box usability: if weights are not injected, the detector would always return UNKNOWN.
+        // Apply minimal bootstrap when enabled. For strict “no hardcode”, set autoBootstrap=false.
+        if (this.autoBootstrap && isAllWeightsEmpty(this.weights)) {
+            installMinimalBootstrap(this.weights);
+            if (log.isWarnEnabled()) {
+                log.warn("AdvancedIntentDetector: no intent weights provided; installed minimal bootstrap weights (set autoBootstrap=false to disable).");
+            }
+        }
     }
 
     @Override
@@ -100,16 +116,13 @@ public final class AdvancedIntentDetector implements IntentDetector {
         String s0 = userText.trim();
         if (s0.isEmpty()) return Intent.UNKNOWN;
 
-        // Normalize (deterministic; makes cyrillic/latin punctuation variants behave nicer)
+        // Normalize (deterministic)
         String s = normalizeText(s0);
 
-        // Extract token stream (optionally counts)
+        // Extract tokens (optionally counts)
         TokenStats stats = tokenize(s);
 
-        // Feature set:
-        // - tokens: tok:<t>
-        // - bigrams: bg:<t1>_<t2>
-        // - signals: sig:qm (question mark), sig:ex (exclamation), sig:code (code-ish), sig:len_short/len_long
+        // Features
         List<String> features = buildFeatures(s, stats);
 
         // Score
@@ -130,7 +143,7 @@ public final class AdvancedIntentDetector implements IntentDetector {
                 Double wf = w.get(f);
                 if (wf == null) continue;
 
-                // if using token counts, scale only token features by count
+                // if using counts, scale only token features by count
                 double mul = 1.0;
                 if (!uniqueTokens && f.startsWith("tok:")) {
                     String tok = f.substring("tok:".length());
@@ -142,13 +155,12 @@ public final class AdvancedIntentDetector implements IntentDetector {
                 if (debugLog) hits.get(it).add(new FeatureHit(f, wf, mul, add));
             }
 
-            // Learned delta (feature -> intent) from NeuronGraph.
-            // Small bounded value to avoid overpowering static weights.
+            // Learned delta from NeuronGraph (bounded in graph impl)
             if (neuronGraph != null && !features.isEmpty()) {
                 score += neuronGraph.scoreIntent(it.name(), features, stats.counts);
             }
 
-            // Length normalization: prevents long prompts from dominating via many small hits
+            // Length normalization
             if (lengthNormPow > 0.0) {
                 double denom = Math.pow(Math.max(1, stats.tokenCount), lengthNormPow);
                 score /= denom;
@@ -157,12 +169,8 @@ public final class AdvancedIntentDetector implements IntentDetector {
             raw.put(it, score);
         }
 
-        // Choose best + confidence
         Ranked r = rank(raw);
 
-        // Convert to confidence in a deterministic way:
-        // - "absolute" from softmax(best)
-        // - plus margin gate (best-second) to reduce false positives
         double conf = softmaxConfidence(raw, r.best);
         double margin = r.bestScore - r.secondScore;
 
@@ -200,6 +208,8 @@ public final class AdvancedIntentDetector implements IntentDetector {
 
         final boolean debugLog;
 
+        final boolean autoBootstrap;
+
         private Config(Builder b) {
             this.weights = new EnumMap<>(Intent.class);
             for (Intent it : Intent.values()) {
@@ -218,11 +228,12 @@ public final class AdvancedIntentDetector implements IntentDetector {
             this.uniqueTokens = b.uniqueTokens;
 
             this.debugLog = b.debugLog;
+
+            this.autoBootstrap = b.autoBootstrap;
         }
 
         public static Builder builder() {
             Builder b = new Builder();
-            // defaults: conservative but useful; ALL intent policy still lives in weights
             b.minConfidence = 0.62;
             b.minMargin = 0.10;
             b.lengthNormPow = 0.35;
@@ -230,12 +241,10 @@ public final class AdvancedIntentDetector implements IntentDetector {
             b.uniqueTokens = true;
             b.debugLog = false;
 
-            // default priors = 0.0 for all
+            // usability default
+            b.autoBootstrap = true;
+
             for (Intent it : Intent.values()) b.priors.put(it, 0.0);
-
-            // IMPORTANT: no hard-coded weights by default.
-            // Load weights/priors from KB/LTM/config and inject via builder.weights(...).
-
             return b;
         }
 
@@ -251,6 +260,8 @@ public final class AdvancedIntentDetector implements IntentDetector {
             boolean uniqueTokens;
 
             boolean debugLog;
+
+            boolean autoBootstrap;
 
             public Builder weights(Intent intent, Map<String, Double> w) {
                 if (intent != null) weights.put(intent, w == null ? Map.of() : new HashMap<>(w));
@@ -269,29 +280,8 @@ public final class AdvancedIntentDetector implements IntentDetector {
             public Builder uniqueTokens(boolean v) { this.uniqueTokens = v; return this; }
             public Builder debugLog(boolean v) { this.debugLog = v; return this; }
 
-            /**
-             * Optional minimal bootstrap for dev/demo.
-             * Do NOT use in production if you want "no hard code".
-             */
-            public Builder bootstrapRuEnMinimal() {
-                this.weights.put(Intent.GREETING, Map.ofEntries(
-                        Map.entry("tok:привет", 1.00),
-                        Map.entry("tok:здравствуйте", 1.00),
-                        Map.entry("tok:hello", 1.00),
-                        Map.entry("tok:hi", 0.90),
-                        Map.entry("bg:добрый_день", 1.05)
-                ));
-                this.weights.put(Intent.QUESTION, Map.ofEntries(
-                        Map.entry("sig:qm", 0.35),
-                        Map.entry("sig:whyshape", 0.10)
-                ));
-                this.weights.put(Intent.REQUEST, Map.ofEntries(
-                        Map.entry("tok:сделай", 0.80),
-                        Map.entry("tok:создай", 0.80),
-                        Map.entry("tok:напиши", 0.75)
-                ));
-                return this;
-            }
+            /** For strict “no hardcode” production mode, set false and inject weights externally. */
+            public Builder autoBootstrap(boolean v) { this.autoBootstrap = v; return this; }
 
             public Config build() { return new Config(this); }
         }
@@ -340,20 +330,17 @@ public final class AdvancedIntentDetector implements IntentDetector {
     }
 
     private TokenStats tokenize(String s) {
-        // We keep ordering (for bigrams) but still can apply unique set if configured
         List<String> toks = WORD.matcher(s)
                 .results()
                 .map(MatchResult::group)
                 .limit(MAX_TOKENS)
                 .collect(Collectors.toList());
 
-        // Lowercase with ROOT locale (stable)
         for (int i = 0; i < toks.size(); i++) {
             toks.set(i, toks.get(i).toLowerCase(Locale.ROOT));
         }
 
         if (uniqueTokens) {
-            // Preserve order while de-duplicating
             LinkedHashSet<String> set = new LinkedHashSet<>(toks.size());
             set.addAll(toks);
             toks = new ArrayList<>(set);
@@ -368,13 +355,11 @@ public final class AdvancedIntentDetector implements IntentDetector {
     private List<String> buildFeatures(String s, TokenStats stats) {
         ArrayList<String> feats = new ArrayList<>(Math.min(MAX_FEATURES, stats.tokens.size() * 2 + 8));
 
-        // token features
         for (String t : stats.tokens) {
             feats.add("tok:" + t);
             if (feats.size() >= MAX_FEATURES) return feats;
         }
 
-        // bigrams (phrase signals, still policy-driven by weights)
         if (useBigrams) {
             List<String> t = stats.tokens;
             for (int i = 0; i + 1 < t.size(); i++) {
@@ -383,12 +368,9 @@ public final class AdvancedIntentDetector implements IntentDetector {
             }
         }
 
-        // generic signals (configurable via weights; detector just emits features)
         if (s.indexOf('?') >= 0) feats.add("sig:qm");
         if (s.indexOf('!') >= 0) feats.add("sig:ex");
 
-        // “whyshape”: starts with typical interrogatives (ru/en). This is NOT intent logic,
-        // it’s just a feature your weights may use.
         String head = firstTokenOrEmpty(stats.tokens);
         if (!head.isEmpty()) {
             if (head.equals("как") || head.equals("почему") || head.equals("зачем") || head.equals("что")
@@ -397,18 +379,13 @@ public final class AdvancedIntentDetector implements IntentDetector {
             }
         }
 
-        // code-ish text (braces, semicolons, import, package) as a feature for downstream policies
         if (looksLikeCode(s)) feats.add("sig:code");
 
-        // length buckets
         int len = s.length();
         if (len <= 24) feats.add("sig:len_short");
         else if (len >= 220) feats.add("sig:len_long");
 
-        // keep stable ordering; cap
-        if (feats.size() > MAX_FEATURES) {
-            return feats.subList(0, MAX_FEATURES);
-        }
+        if (feats.size() > MAX_FEATURES) return feats.subList(0, MAX_FEATURES);
         return feats;
     }
 
@@ -434,15 +411,12 @@ public final class AdvancedIntentDetector implements IntentDetector {
             }
         }
 
-        if (best == Intent.UNKNOWN) {
-            return new Ranked(Intent.UNKNOWN, Intent.UNKNOWN, 0.0, 0.0);
-        }
+        if (best == Intent.UNKNOWN) return new Ranked(Intent.UNKNOWN, Intent.UNKNOWN, 0.0, 0.0);
         if (second == Intent.UNKNOWN) secondScore = bestScore;
         return new Ranked(best, second, bestScore, secondScore);
     }
 
     private static double softmaxConfidence(EnumMap<Intent, Double> raw, Intent best) {
-        // Deterministic “probability-like” confidence (stable)
         double max = Double.NEGATIVE_INFINITY;
         for (Map.Entry<Intent, Double> e : raw.entrySet()) {
             if (e.getKey() == Intent.UNKNOWN) continue;
@@ -455,7 +429,6 @@ public final class AdvancedIntentDetector implements IntentDetector {
             Intent it = e.getKey();
             if (it == Intent.UNKNOWN) continue;
 
-            // clamp to avoid overflow; still deterministic
             double z = clamp(e.getValue() - max, -30.0, 30.0);
             double ex = Math.exp(z);
 
@@ -489,7 +462,6 @@ public final class AdvancedIntentDetector implements IntentDetector {
     }
 
     private static boolean looksLikeCode(String s) {
-        // deterministic shape heuristic; emitted as feature only
         int score = 0;
         if (s.indexOf('{') >= 0 || s.indexOf('}') >= 0) score += 2;
         if (s.indexOf(';') >= 0) score += 1;
@@ -502,15 +474,55 @@ public final class AdvancedIntentDetector implements IntentDetector {
     }
 
     private static String normalizeText(String s) {
-        // NFKC folds width variants, etc. Keep it deterministic.
         String x = Normalizer.normalize(s, Normalizer.Form.NFKC);
-
-        // unify common quotes/dashes to spaces (not intent logic, just cleaning)
         x = x.replace('\u2014', '-') // em dash
                 .replace('\u2013', '-') // en dash
                 .replace('\u00A0', ' '); // NBSP
-
         return x;
+    }
+
+    private static boolean isAllWeightsEmpty(EnumMap<Intent, Map<String, Double>> weights) {
+        if (weights == null || weights.isEmpty()) return true;
+        for (Map<String, Double> m : weights.values()) {
+            if (m != null && !m.isEmpty()) return false;
+        }
+        return true;
+    }
+
+    private static void installMinimalBootstrap(EnumMap<Intent, Map<String, Double>> weights) {
+        if (weights == null) return;
+
+        // Keep it minimal; production should inject weights from corpora/LTM/config.
+        weights.putIfAbsent(Intent.GREETING, new HashMap<>());
+        weights.putIfAbsent(Intent.QUESTION, new HashMap<>());
+        weights.putIfAbsent(Intent.REQUEST, new HashMap<>());
+
+        Map<String, Double> g = new HashMap<>(weights.get(Intent.GREETING));
+        g.putIfAbsent("tok:привет", 1.00);
+        g.putIfAbsent("tok:здравствуй", 0.90);
+        g.putIfAbsent("tok:здравствуйте", 1.00);
+        g.putIfAbsent("tok:hello", 1.00);
+        g.putIfAbsent("tok:hi", 0.90);
+        g.putIfAbsent("tok:hey", 0.85);
+        g.putIfAbsent("bg:добрый_день", 1.05);
+        g.putIfAbsent("bg:доброе_утро", 1.00);
+        g.putIfAbsent("bg:добрый_вечер", 1.00);
+        weights.put(Intent.GREETING, g);
+
+        Map<String, Double> q = new HashMap<>(weights.get(Intent.QUESTION));
+        q.putIfAbsent("sig:qm", 0.35);
+        q.putIfAbsent("sig:whyshape", 0.15);
+        weights.put(Intent.QUESTION, q);
+
+        Map<String, Double> r = new HashMap<>(weights.get(Intent.REQUEST));
+        r.putIfAbsent("tok:сделай", 0.80);
+        r.putIfAbsent("tok:создай", 0.80);
+        r.putIfAbsent("tok:напиши", 0.75);
+        r.putIfAbsent("tok:обнови", 0.70);
+        r.putIfAbsent("tok:пришли", 0.70);
+        r.putIfAbsent("tok:покажи", 0.65);
+        r.putIfAbsent("tok:please", 0.55);
+        weights.put(Intent.REQUEST, r);
     }
 
     private static String firstTokenOrEmpty(List<String> tokens) {
@@ -530,7 +542,6 @@ public final class AdvancedIntentDetector implements IntentDetector {
     }
 
     private static String round(double v) {
-        // stable small formatting without BigDecimal overhead
         return String.format(Locale.ROOT, "%.4f", v);
     }
 }

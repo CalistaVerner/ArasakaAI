@@ -1,13 +1,12 @@
 package org.calista.arasaka.ai.think.engine.impl;
 
+import org.apache.logging.log4j.CloseableThreadContext;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.logging.log4j.CloseableThreadContext;
 import org.apache.logging.log4j.ThreadContext;
 import org.calista.arasaka.ai.knowledge.Statement;
 import org.calista.arasaka.ai.retrieve.retriver.Retriever;
 import org.calista.arasaka.ai.retrieve.retriver.impl.KnowledgeRetriever;
-import org.calista.arasaka.ai.think.ResponseStrategy;
 import org.calista.arasaka.ai.think.ThoughtResult;
 import org.calista.arasaka.ai.think.ThoughtState;
 import org.calista.arasaka.ai.think.candidate.Candidate;
@@ -15,16 +14,12 @@ import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.think.engine.ThoughtCycleEngine;
 import org.calista.arasaka.ai.think.intent.Intent;
 import org.calista.arasaka.ai.think.intent.IntentDetector;
+import org.calista.arasaka.ai.think.response.ResponseStrategy;
 import org.calista.arasaka.ai.think.textGenerator.TextGenerator;
 
-import java.lang.reflect.Constructor;
-import java.lang.reflect.Field;
 import java.text.Normalizer;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -32,32 +27,26 @@ import java.util.stream.Collectors;
  * Enterprise deterministic think-loop:
  * retrieve -> rerank -> compress -> draft -> evaluate -> self-correct -> (optional) LTM.
  *
- * Enterprise rules:
- * - NEVER feed telemetry/critique/internal markers into retriever queries (prevents cache poisoning)
- * - NO domain semantic hardcode (identity/smalltalk lives in corpora)
- * - deterministic ordering and stable keys
+ * Key fixes in this version:
+ *  - DO NOT poison retrieval with "UNKNOWN" intent token.
+ *  - DO NOT derive refine queries from a bad/invalid bestSoFar.
+ *  - DO NOT collapse drafts to 1 when generator mode-collapses (keep 2..4 for evaluator).
+ *  - For very short inputs (<=2 tokens) use "summary" only sections (no "need context" behavior).
+ *
+ * Ownership fix:
+ *  - Evaluation executor is injected (owned by Think orchestrator).
+ *  - No static pools here.
+ *
+ * Logging policy:
+ *  - INFO  : start/end + per-iteration compact summary
+ *  - DEBUG : queries, stop reason, top candidates summary, retrieval type/quality
+ *  - TRACE : context previews, drafts previews, derived queries, tags
  */
 public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
     private static final Logger log = LogManager.getLogger(IterativeThoughtEngine.class);
 
-    // Dedicated pool to avoid ForkJoin commonPool interference and stabilize tail latency.
-    private static final AtomicLong EVAL_THREAD_ID = new AtomicLong(1);
-    private static final int EVAL_PAR = Math.max(1, Math.min(8, Runtime.getRuntime().availableProcessors()));
-    private static final ExecutorService EVAL_POOL = new ThreadPoolExecutor(
-            EVAL_PAR,
-            EVAL_PAR,
-            30L, TimeUnit.SECONDS,
-            new LinkedBlockingQueue<>(4096),
-            r -> {
-                Thread t = new Thread(r, "think-eval-" + EVAL_THREAD_ID.getAndIncrement());
-                t.setDaemon(true);
-                return t;
-            },
-            new ThreadPoolExecutor.CallerRunsPolicy()
-    );
-
-    // tokenization for recall/overlap (>=3 keeps noise low; still configurable via code edits if needed)
+    // tokenization for recall/overlap
     private static final java.util.regex.Pattern WORD = java.util.regex.Pattern.compile("[\\p{L}\\p{Nd}_]{3,}");
 
     // telemetry signatures + internal markers (generic, non-domain)
@@ -67,18 +56,22 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             + "(\\bqc=)|(\\bg=)|(\\bnov=)|(\\brep=)|(\\bmd=)|"
             + "(\\bno_context\\b)|(\\bnoctx\\b)|(\\bmore_evidence\\b)|(\\bfix\\b)|(\\bnotes\\b)");
 
-    // --- Production RAG knobs (engine-level, deterministic defaults) ---
-    private static final int RERANK_N = 80;                   // rerank top-N
-    private static final int RERANK_M = 16;                   // keep top-M after rerank
-    private static final int COMPRESS_SENTENCES = 2;          // best sentences per statement
-    private static final int COMPRESS_MAX_CHARS = 700;        // cap per compressed statement
-    private static final double DERIVE_DF_CUT = 0.60;         // ban "water" tokens in query-derivation
+    // --- RAG knobs ---
+    private static final int RERANK_N = 80;
+    private static final int RERANK_M = 16;
+    private static final int COMPRESS_SENTENCES = 2;
+    private static final int COMPRESS_MAX_CHARS = 700;
+    private static final double DERIVE_DF_CUT = 0.60;
 
     private final Retriever retriever;
     private final IntentDetector intentDetector;
     private final ResponseStrategy strategy;
     private final CandidateEvaluator evaluator;
     private final TextGenerator generator;
+
+    // injected eval resources (owned by Think)
+    private final ExecutorService evalPool;
+    private final int evalParallelism;
 
     private final int iterations;
     private final int retrieveK;
@@ -96,21 +89,25 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     private final ConcurrentMap<String, Double> ltmPriorityByKey = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Set<String>> ltmTokensByKey = new ConcurrentHashMap<>();
 
-    // refinement inside each iteration
+    // refinement
     private final int refineRounds;
     private final int refineQueryBudget;
 
-    // pipelines
     private final List<QueryProvider> queryProviders;
     private final List<Predicate<String>> queryFilters;
     private final List<StopRule> stopRules;
 
+    /**
+     * Основной конструктор (рекомендуемый): evalPool и параллелизм инжектятся сверху (Think).
+     */
     public IterativeThoughtEngine(
             Retriever retriever,
             IntentDetector intentDetector,
             ResponseStrategy strategy,
             CandidateEvaluator evaluator,
             TextGenerator generator,
+            ExecutorService evalPool,
+            int evalParallelism,
             int iterations,
             int retrieveK,
             int draftsPerIteration,
@@ -122,6 +119,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             double ltmWriteMinGroundedness
     ) {
         this(retriever, intentDetector, strategy, evaluator, generator,
+                evalPool, evalParallelism,
                 iterations, retrieveK, draftsPerIteration, patience, targetScore,
                 ltmEnabled, ltmCapacity, ltmRecallK, ltmWriteMinGroundedness,
                 1, 16);
@@ -133,6 +131,8 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             ResponseStrategy strategy,
             CandidateEvaluator evaluator,
             TextGenerator generator,
+            ExecutorService evalPool,
+            int evalParallelism,
             int iterations,
             int retrieveK,
             int draftsPerIteration,
@@ -145,17 +145,19 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             int refineRounds,
             int refineQueryBudget
     ) {
-
         this.retriever = Objects.requireNonNull(retriever, "retriever");
         this.intentDetector = Objects.requireNonNull(intentDetector, "intentDetector");
         this.strategy = Objects.requireNonNull(strategy, "strategy");
         this.evaluator = Objects.requireNonNull(evaluator, "evaluator");
         this.generator = generator;
 
+        this.evalPool = Objects.requireNonNull(evalPool, "evalPool");
+        this.evalParallelism = Math.max(1, evalParallelism);
+
         this.iterations = Math.max(1, iterations);
         this.retrieveK = Math.max(1, retrieveK);
 
-        // IMPORTANT: drafts=1 causes deterministic mode collapse (echo-loop) with beam/bigram generators.
+        // IMPORTANT: drafts=1 causes deterministic mode collapse with beam/bigram generators.
         this.draftsPerIteration = Math.max(6, draftsPerIteration);
 
         this.patience = Math.max(0, patience);
@@ -171,8 +173,8 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
         this.queryProviders = List.of(
                 QueryProvider.userText(),
-                QueryProvider.intentName(),
-                QueryProvider.bestTerms(10, 5) // hygienic terms from bestSoFar
+                QueryProvider.intentName(),       // FIX: skips UNKNOWN
+                QueryProvider.bestTerms(10, 5)    // FIX: gated on bestSoFar quality
         );
 
         this.queryFilters = List.of(
@@ -186,12 +188,19 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 StopRule.targetScore(targetScore),
                 StopRule.patience(patience)
         );
+
+        if (log.isInfoEnabled()) {
+            log.info("IterativeThoughtEngine created: iterations={} retrieveK={} draftsPerIter={} patience={} targetScore={} refineRounds={} refineQueryBudget={} ltmEnabled={} ltmCap={} ltmRecallK={} evalPar={}",
+                    this.iterations, this.retrieveK, this.draftsPerIteration, this.patience, fmt(this.targetScore),
+                    this.refineRounds, this.refineQueryBudget,
+                    this.ltmEnabled, this.ltmCapacity, this.ltmRecallK,
+                    this.evalParallelism);
+        }
     }
 
     @Override
     public ThoughtResult think(String userText, long seed) {
 
-        // Correlation fields for structured logging (safe: do not put full user text in MDC).
         final String reqId = Long.toUnsignedString(mix(seed, System.nanoTime()), 36);
         try (final CloseableThreadContext.Instance ctc = CloseableThreadContext.put("reqId", reqId)
                 .put("seed", Long.toUnsignedString(seed))
@@ -204,8 +213,13 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             ThreadContext.put("intent", intent == null ? "UNKNOWN" : intent.name());
 
             if (log.isInfoEnabled()) {
-                log.info("think.start len={} tok={} hasGen={} refineRounds={} ltmEnabled={} iterations={} retrieveK={} draftsPerIter={}",
-                        q0.length(), approxQueryTokenCount(q0), generator != null, refineRounds, ltmEnabled, iterations, retrieveK, draftsPerIteration);
+                log.info("think.start len={} tok={} intent={} hasGen={} refineRounds={} ltmEnabled={} iterations={} retrieveK={} draftsPerIter={} evalPar={}",
+                        q0.length(), approxQueryTokenCount(q0),
+                        (intent == null ? "UNKNOWN" : intent.name()),
+                        generator != null, refineRounds, ltmEnabled, iterations, retrieveK, draftsPerIteration, evalParallelism);
+            }
+            if (log.isDebugEnabled()) {
+                log.debug("think.q0='{}'", preview(q0, 240));
             }
 
             ThoughtState state = new ThoughtState();
@@ -214,7 +228,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             state.query = q0;
 
             if (state.tags == null) state.tags = new HashMap<>(16);
-            initResponseSchema(state, q0, intent);
+            initResponseSchema(state, q0, intent); // FIX: short queries => summary only
 
             Candidate globalBest = new Candidate("", Double.NEGATIVE_INFINITY, "", null);
             state.bestSoFar = globalBest;
@@ -222,7 +236,9 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
             List<String> trace = new ArrayList<>(Math.max(8, iterations * 3));
             trace.add("reqId=" + reqId + " seed=" + Long.toUnsignedString(seed));
+
             int stagnation = 0;
+            StopDecision stopDecision = null;
 
             for (int iter = 1; iter <= iterations; iter++) {
                 state.iteration = iter;
@@ -232,20 +248,23 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 // generator hint only (never used for retrieval)
                 state.generationHint = buildGenerationHint(state);
 
-                // ---- queries (no critique, no telemetry) ----
+                // ---- queries ----
                 List<String> baseQueries = buildQueries(q0, state);
+                if (log.isDebugEnabled()) {
+                    log.debug("iter={} queries.n={} queries={}", iter, baseQueries.size(), baseQueries);
+                }
 
+                // ---- retrieve/rerank/compress ----
                 final long tRetr0 = System.nanoTime();
                 RetrievalBundle bundle = retrieveRerankCompress(q0, baseQueries, state.seed);
                 final long tRetr = System.nanoTime() - tRetr0;
 
-                // ---- LTM recall (optional) ----
+                // ---- LTM recall ----
                 final long tLtm0 = System.nanoTime();
                 List<Statement> recalled = ltmEnabled ? recallFromLtm(baseQueries) : List.of();
                 state.recalledMemory = recalled;
                 final long tLtm = System.nanoTime() - tLtm0;
 
-                // Merge LTM evidence into RAW (for storage/diagnostics), then rerank+compress again (cheap)
                 if (!recalled.isEmpty()) {
                     Map<String, Statement> mergedByKey = new ConcurrentHashMap<>();
                     mergeStatements(bundle.rawEvidence, mergedByKey);
@@ -258,22 +277,37 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                     bundle = bundle.withMerged(merged, reranked, compressed);
                 }
 
-                // ---- deterministic context for generator (compressed first) ----
+                // ---- context for generator (compressed first) ----
                 List<Statement> context = (bundle.compressedContext == null || bundle.compressedContext.isEmpty())
                         ? bundle.rerankedContext
                         : bundle.compressedContext;
 
                 state.lastContext = context;
 
+                if (log.isTraceEnabled()) {
+                    log.trace("iter={} ctx.raw.n={} ctx.rerank.n={} ctx.compress.n={} ctx.preview={}",
+                            iter,
+                            safeSize(bundle.rawEvidence), safeSize(bundle.rerankedContext), safeSize(bundle.compressedContext),
+                            previewContext(context, 3, 260));
+                }
+
                 // ---- deterministic generation control (tags) ----
                 tuneGenerationTags(state, q0, context);
+
+                if (log.isTraceEnabled() && state.tags != null && !state.tags.isEmpty()) {
+                    log.trace("iter={} tags={}", iter, stableSmallMap(state.tags, 32));
+                }
 
                 // ---- drafts ----
                 final long tGen0 = System.nanoTime();
                 List<String> drafts = Drafts.sanitize(generateDrafts(q0, context, state), draftsPerIteration);
                 final long tGen = System.nanoTime() - tGen0;
 
-                // ---- evaluate (stable pool; no commonPool) ----
+                if (log.isTraceEnabled()) {
+                    log.trace("iter={} drafts.n={} drafts.preview={}", iter, drafts.size(), previewList(drafts, 3, 220));
+                }
+
+                // ---- evaluate ----
                 final long tEval0 = System.nanoTime();
                 List<Candidate> evaluated = evaluateDrafts(q0, context, drafts);
                 final long tEval = System.nanoTime() - tEval0;
@@ -281,7 +315,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 Candidate bestIter = pickBest(evaluated).orElse(globalBest);
 
                 state.lastCandidate = bestIter;
-                state.lastCritique = bestIter.critique; // internal only (numeric-only)
+                state.lastCritique = bestIter.critique;
                 state.lastEvaluation = bestIter.evaluation;
 
                 boolean improved = bestIter.score > globalBest.score + 1e-9;
@@ -296,8 +330,12 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
                 // ---- LTM writeback (evidence-only) ----
                 if (ltmEnabled && bestIter.evaluation != null && bestIter.evaluation.valid) {
-                    // store evidence, not answer; use reranked/compressed evidence
+                    int before = ltmByKey.size();
                     maybeWritebackToLtm(bestIter, context);
+                    int after = ltmByKey.size();
+                    if (log.isDebugEnabled() && after != before) {
+                        log.debug("iter={} ltm.write added={} ltm.size={}", iter, (after - before), after);
+                    }
                 }
 
                 trace.add("iter=" + iter
@@ -308,37 +346,70 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                         + " drafts=" + drafts.size()
                         + " bestIter=" + fmt(bestIter.score)
                         + " global=" + fmt(globalBest.score)
+                        + " stg=" + stagnation
                         + " tRetrMs=" + (tRetr / 1_000_000)
                         + " tLtmMs=" + (tLtm / 1_000_000)
                         + " tGenMs=" + (tGen / 1_000_000)
                         + " tEvalMs=" + (tEval / 1_000_000)
                         + (bundle.traceQuality != null ? (" rq=" + fmt(bundle.traceQuality)) : ""));
 
-                if (log.isDebugEnabled()) {
-                    log.debug("think.iter raw={} rerank={} compress={} ltm={} drafts={} bestIter={} global={} tRetrMs={} tLtmMs={} tGenMs={} tEvalMs={}{}",
-                            safeSize(bundle.rawEvidence), safeSize(bundle.rerankedContext), safeSize(bundle.compressedContext),
-                            state.recalledMemory == null ? 0 : state.recalledMemory.size(), drafts.size(),
+                // ---- per-iteration compact summary (INFO) ----
+                if (log.isInfoEnabled()) {
+                    CandidateEvaluator.Evaluation ev = bestIter.evaluation;
+                    log.info("think.iter iter={} improved={} stg={} bestIter={} global={} eff={} valid={} g={} cs={} cov={} st={} risk={} ctx={} ltm={} drafts={} tRetrMs={} tLtmMs={} tGenMs={} tEvalMs={}{}",
+                            iter, improved, stagnation,
                             fmt(bestIter.score), fmt(globalBest.score),
+                            fmt(ev == null ? 0.0 : ev.effectiveScore()),
+                            (ev != null && ev.valid),
+                            (ev == null ? "0" : fmt(ev.groundedness)),
+                            (ev == null ? "0" : fmt(ev.contextSupport)),
+                            (ev == null ? "0" : fmt(ev.coverage)),
+                            (ev == null ? "0" : fmt(ev.structureScore)),
+                            (ev == null ? "0" : fmt(ev.contradictionRisk)),
+                            safeSize(context),
+                            (state.recalledMemory == null ? 0 : state.recalledMemory.size()),
+                            drafts.size(),
                             (tRetr / 1_000_000), (tLtm / 1_000_000), (tGen / 1_000_000), (tEval / 1_000_000),
                             bundle.traceQuality != null ? (" rq=" + fmt(bundle.traceQuality)) : "");
                 }
 
-                if (shouldStop(state, globalBest, stagnation)) break;
+                // ---- DEBUG: top candidates ----
+                if (log.isDebugEnabled()) {
+                    log.debug("iter={} top={}", iter, topCandidatesSummary(evaluated, 4));
+                }
+
+                // ---- stop ----
+                stopDecision = shouldStopWithReason(state, globalBest, stagnation);
+                if (stopDecision.stop) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("think.stop iter={} reason={} bestScore={} target={} stg={} patience={}",
+                                iter, stopDecision.reason, fmt(globalBest.score), fmt(targetScore), stagnation, patience);
+                    }
+                    break;
+                }
             }
 
             CandidateEvaluator.Evaluation ev = (globalBest == null) ? null : globalBest.evaluation;
             long tTotal = System.nanoTime() - tStart;
+
             if (log.isInfoEnabled()) {
-                log.info("think.end answerLen={} score={} valid={} totalMs={} traceN={} ltmSize={}",
+                log.info("think.end answerLen={} score={} eff={} valid={} g={} cs={} cov={} st={} risk={} stylePen={} totalMs={} traceN={} ltmSize={} stopReason={}",
                         globalBest == null ? 0 : globalBest.text.length(),
                         fmt(globalBest == null ? 0.0 : globalBest.score),
+                        fmt(ev == null ? 0.0 : ev.effectiveScore()),
                         ev != null && ev.valid,
+                        ev == null ? "0" : fmt(ev.groundedness),
+                        ev == null ? "0" : fmt(ev.contextSupport),
+                        ev == null ? "0" : fmt(ev.coverage),
+                        ev == null ? "0" : fmt(ev.structureScore),
+                        ev == null ? "0" : fmt(ev.contradictionRisk),
+                        ev == null ? "0" : fmt(ev.stylePenalty),
                         (tTotal / 1_000_000),
                         trace.size(),
-                        ltmByKey.size());
+                        ltmByKey.size(),
+                        stopDecision == null ? "none" : stopDecision.reason);
             }
 
-            // avoid MDC leakage across requests (esp. in thread pools)
             ThreadContext.remove("intent");
             ThreadContext.remove("iter");
 
@@ -346,13 +417,12 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         }
     }
 
-    // -------------------- evaluation (deterministic + stable parallelism) --------------------
+    // -------------------- evaluation --------------------
 
     private List<Candidate> evaluateDrafts(String userText, List<Statement> context, List<String> drafts) {
         if (drafts == null || drafts.isEmpty()) return List.of();
 
-        // Small lists are cheaper sequentially and avoid context switching.
-        if (drafts.size() <= 2 || EVAL_PAR <= 1) {
+        if (drafts.size() <= 2 || evalParallelism <= 1) {
             ArrayList<Candidate> out = new ArrayList<>(drafts.size());
             for (String d : drafts) {
                 CandidateEvaluator.Evaluation ev = evaluator.evaluate(userText, d, context);
@@ -361,7 +431,6 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             return out;
         }
 
-        // Snapshot MDC to propagate correlation fields into worker threads (if evaluator logs).
         final Map<String, String> mdc = ThreadContext.getImmutableContext();
 
         ArrayList<CompletableFuture<Candidate>> fs = new ArrayList<>(drafts.size());
@@ -374,7 +443,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 } finally {
                     if (mdc != null && !mdc.isEmpty()) ThreadContext.clearMap();
                 }
-            }, EVAL_POOL));
+            }, evalPool));
         }
 
         CompletableFuture.allOf(fs.toArray(new CompletableFuture[0])).join();
@@ -395,15 +464,17 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     // -------------------- retrieve -> rerank -> compress --------------------
 
     private RetrievalBundle retrieveRerankCompress(String userQuery, List<String> baseQueries, long seed) {
-        // Fast path: if retriever is KnowledgeRetriever, we get a full Trace (already has rerank/compress internally).
+
+        if (log.isTraceEnabled()) {
+            log.trace("retrieve.start seed={} k={} queries={}", Long.toUnsignedString(seed), retrieveK, baseQueries);
+        }
+
         if (retriever instanceof KnowledgeRetriever kr) {
-            // IMPORTANT: never pass critique/telemetry. baseQueries are already hygienic.
             String joined = String.join("\n", baseQueries);
             KnowledgeRetriever.Trace tr = kr.retrieveTrace(joined, retrieveK, seed);
 
             List<Statement> selected = (tr.selected == null) ? List.of() : tr.selected;
 
-            // Prefer compressedContext from retriever if available; else compress here deterministically.
             List<Statement> compressed;
             if (tr.compressedContext != null && !tr.compressedContext.isEmpty()) {
                 compressed = tr.compressedContext.stream()
@@ -416,7 +487,6 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 compressed = compressContextToStatements(userQuery, selected, COMPRESS_SENTENCES, COMPRESS_MAX_CHARS);
             }
 
-            // rerankedTop is already post-rerank (topM). Use it if present; else rerank locally.
             List<Statement> reranked;
             if (tr.rerankedTop != null && !tr.rerankedTop.isEmpty()) {
                 reranked = tr.rerankedTop.stream()
@@ -427,26 +497,37 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
                 reranked = rerankContext(userQuery, selected, RERANK_N, RERANK_M);
             }
 
+            if (log.isDebugEnabled()) {
+                log.debug("retrieve.done type=KnowledgeRetriever raw={} rerank={} compress={} rq={}",
+                        safeSize(selected), safeSize(reranked), safeSize(compressed), (tr.quality == 0 ? "null" : fmt(tr.quality)));
+            }
+
             return new RetrievalBundle(selected, reranked, compressed, tr.quality);
         }
 
-        // Fallback: use existing engine pipeline, then do rerank+compress here (production RAG).
         Map<String, Statement> mergedByKey = new ConcurrentHashMap<>();
         retrieveAndMerge(baseQueries, mergedByKey, seed);
 
         for (int r = 0; r < refineRounds; r++) {
             List<Statement> ctxNow = toDeterministicContext(mergedByKey);
 
-            // NOTE: anti-water IDF derive
             List<String> derived = deriveQueriesFromContext(ctxNow, refineQueryBudget);
+            if (log.isTraceEnabled()) {
+                log.trace("retrieve.refine round={} derived.n={} derived={}", r, derived.size(), derived);
+            }
             if (derived.isEmpty()) break;
+
             retrieveAndMerge(derived, mergedByKey, mix(seed, 0x9E3779B97F4A7C15L + r));
         }
 
         List<Statement> raw = toDeterministicContext(mergedByKey);
-
         List<Statement> reranked = rerankContext(userQuery, raw, RERANK_N, RERANK_M);
         List<Statement> compressed = compressContextToStatements(userQuery, reranked, COMPRESS_SENTENCES, COMPRESS_MAX_CHARS);
+
+        if (log.isDebugEnabled()) {
+            log.debug("retrieve.done type=GenericRetriever raw={} rerank={} compress={}",
+                    safeSize(raw), safeSize(reranked), safeSize(compressed));
+        }
 
         return new RetrievalBundle(raw, reranked, compressed, null);
     }
@@ -457,16 +538,11 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
     // -------------------- rerank --------------------
 
-    /**
-     * Deterministic rerank: scores each Statement by token overlap with the userQuery.
-     * Keep topM from topN candidates to reduce noise before generation.
-     */
     private static List<Statement> rerankContext(String userQuery, List<Statement> raw, int topN, int topM) {
         if (raw == null || raw.isEmpty()) return List.of();
 
         Set<String> qTok = tokens(userQuery);
         if (qTok.isEmpty()) {
-            // No tokens: fallback to stable ordering
             return raw.stream()
                     .sorted(Comparator.comparing(IterativeThoughtEngine::stableStmtKey, Comparator.nullsLast(String::compareTo)))
                     .limit(Math.max(1, topM))
@@ -508,7 +584,6 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         int inter = 0;
         for (String t : qTok) if (tTok.contains(t)) inter++;
 
-        // precision-like: how much of query is covered
         return (double) inter / (double) Math.max(1, qTok.size());
     }
 
@@ -537,12 +612,16 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
     // -------------------- stop rules --------------------
 
-    private boolean shouldStop(ThoughtState state, Candidate globalBest, int stagnation) {
+    private StopDecision shouldStopWithReason(ThoughtState state, Candidate globalBest, int stagnation) {
         for (StopRule r : stopRules) {
-            if (r.shouldStop(state, globalBest, stagnation)) return true;
+            if (r.shouldStop(state, globalBest, stagnation)) {
+                return new StopDecision(true, r.name());
+            }
         }
-        return false;
+        return new StopDecision(false, "none");
     }
+
+    private record StopDecision(boolean stop, String reason) {}
 
     // -------------------- schema/hints --------------------
 
@@ -567,17 +646,22 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
         Optional.ofNullable(state.lastEvaluation).ifPresent(last -> {
             sb.append(";last_g=").append(fmt(last.groundedness));
+            sb.append(";last_cs=").append(fmt(last.contextSupport));
+            sb.append(";last_cov=").append(fmt(last.coverage));
+            sb.append(";last_st=").append(fmt(last.structureScore));
             sb.append(";last_r=").append(fmt(last.contradictionRisk));
             sb.append(";last_v=").append(last.valid ? 1 : 0);
         });
 
         Optional.ofNullable(state.bestEvaluation).ifPresent(best -> {
             sb.append(";best_g=").append(fmt(best.groundedness));
+            sb.append(";best_cs=").append(fmt(best.contextSupport));
+            sb.append(";best_cov=").append(fmt(best.coverage));
+            sb.append(";best_st=").append(fmt(best.structureScore));
             sb.append(";best_r=").append(fmt(best.contradictionRisk));
             sb.append(";best_v=").append(best.valid ? 1 : 0);
         });
 
-        // Numeric-only refinement signals (safe for generation, blocked from retrieval by TELEMETRY filter).
         Optional.ofNullable(state.lastCandidate).ifPresent(c -> {
             if (c.critique != null && !c.critique.isBlank()) sb.append(";last_ctl=").append(c.critique);
         });
@@ -596,7 +680,14 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         boolean ru = isMostlyCyrillic(userText);
 
         state.tags.putIfAbsent("response.style", "md");
-        state.tags.putIfAbsent("response.sections", "summary,evidence,actions");
+
+        int qTok = approxQueryTokenCount(userText);
+        if (qTok > 0 && qTok <= 2) {
+            state.tags.put("response.sections", "summary");
+        } else {
+            state.tags.putIfAbsent("response.sections", "summary,evidence,actions");
+        }
+
         state.tags.putIfAbsent("response.label.summary", ru ? "Вывод" : "Conclusion");
         state.tags.putIfAbsent("response.label.evidence", ru ? "Опора на контекст" : "Evidence from context");
         state.tags.putIfAbsent("response.label.actions", ru ? "Следующие шаги" : "Next steps");
@@ -669,7 +760,6 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     private static void appendRepairHint(ThoughtState state, StringBuilder sb) {
         if (state == null || state.tags == null || sb == null) return;
 
-        // Compact, deterministic order
         String a = state.tags.get("repair.addEvidence");
         String n = state.tags.get("repair.reduceNovelty");
         String f = state.tags.get("repair.fixStructure");
@@ -679,29 +769,16 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             sb.append(";repair=");
             boolean first = true;
 
-            if ("1".equals(a)) {
-                sb.append("addEvidence");
-                first = false;
-            }
-            if ("1".equals(n)) {
-                sb.append(first ? "" : ",").append("reduceNovelty");
-                first = false;
-            }
-            if ("1".equals(f)) {
-                sb.append(first ? "" : ",").append("fixStructure");
-                first = false;
-            }
-            if ("1".equals(e)) {
-                sb.append(first ? "" : ",").append("avoidEcho");
-            }
+            if ("1".equals(a)) { sb.append("addEvidence"); first = false; }
+            if ("1".equals(n)) { sb.append(first ? "" : ",").append("reduceNovelty"); first = false; }
+            if ("1".equals(f)) { sb.append(first ? "" : ",").append("fixStructure"); first = false; }
+            if ("1".equals(e)) { sb.append(first ? "" : ",").append("avoidEcho"); }
         }
     }
 
-    // Echo-risk: generic overlap heuristic, no domain rules.
     private static boolean isEchoRisk(String userText, String lastText) {
         if (lastText == null || lastText.isBlank()) return false;
 
-        // Too short responses are often low-signal echoes
         if (lastText.trim().length() < 40) return true;
 
         Set<String> q = tokens(userText);
@@ -712,7 +789,6 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         for (String t : q) if (a.contains(t)) inter++;
 
         double jacc = (double) inter / (double) Math.max(1, (q.size() + a.size() - inter));
-        // High token overlap => likely echo/paraphrase loop
         return jacc >= 0.72;
     }
 
@@ -773,7 +849,6 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     private static List<String> deriveQueriesFromContext(List<Statement> ctx, int budget) {
         if (ctx == null || ctx.isEmpty() || budget <= 0) return List.of();
 
-        // Token DF across statements
         HashMap<String, Integer> df = new HashMap<>(512);
         int n = 0;
         for (Statement s : ctx) {
@@ -784,7 +859,6 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         }
         if (n <= 0) return List.of();
 
-        // take informative tokens (low DF)
         ArrayList<String> cands = new ArrayList<>(df.size());
         for (var e : df.entrySet()) {
             double frac = (double) e.getValue() / (double) n;
@@ -810,7 +884,6 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             if (st == null || st.text == null || st.text.isBlank()) continue;
             String txt = st.text.trim();
 
-            // crude sentence split (unicode-safe enough)
             String[] parts = txt.split("(?<=[.!?…。！？])\\s+");
             StringBuilder b = new StringBuilder(Math.min(txt.length(), cap));
             int taken = 0;
@@ -839,7 +912,6 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
             out.add(syn);
         }
 
-        // deterministic ordering
         out.sort(Comparator.comparing(IterativeThoughtEngine::stableStmtKey, Comparator.nullsLast(String::compareTo)));
         return out;
     }
@@ -847,7 +919,6 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     private static Statement syntheticStatementOrNull(Object o) {
         if (o == null) return null;
         if (o instanceof Statement s) return s;
-        // If retriever returns compressed context as String, wrap it
         if (o instanceof String str) {
             if (str.isBlank()) return null;
             Statement st = new Statement();
@@ -889,7 +960,6 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         for (String t : qTokens) if (st.contains(t)) inter++;
 
         double overlap = (st.isEmpty() || qTokens.isEmpty()) ? 0.0 : (double) inter / (double) Math.max(1, qTokens.size());
-
         double pr = ltmPriorityByKey.getOrDefault(key, 0.0);
         return overlap * 0.80 + clamp01(pr) * 0.20;
     }
@@ -940,9 +1010,16 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     private static Optional<Candidate> pickBest(List<Candidate> evaluated) {
         if (evaluated == null || evaluated.isEmpty()) return Optional.empty();
         Candidate best = null;
+        double bestEff = Double.NEGATIVE_INFINITY;
+
         for (Candidate c : evaluated) {
             if (c == null) continue;
-            if (best == null || c.score > best.score) best = c;
+            CandidateEvaluator.Evaluation ev = c.evaluation;
+            double eff = (ev != null && ev.isSane()) ? ev.effectiveScore() : c.score;
+            if (best == null || eff > bestEff) {
+                best = c;
+                bestEff = eff;
+            }
         }
         return Optional.ofNullable(best);
     }
@@ -1028,67 +1105,210 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         return String.format(Locale.ROOT, "%.4f", v);
     }
 
-    // -------------------- nested pipeline contracts --------------------
+    // =====================================================================
+    // Extra logging helpers (safe, non-heavy)
+    // =====================================================================
+
+    private static String preview(String s, int max) {
+        if (s == null) return "";
+        String x = s.replace("\n", "\\n").replace("\r", "\\r").trim();
+        if (x.length() <= max) return x;
+        return x.substring(0, Math.max(0, max - 1)) + "…";
+    }
+
+    private static String previewContext(List<Statement> ctx, int n, int perItemMax) {
+        if (ctx == null || ctx.isEmpty()) return "[]";
+        int k = Math.min(n, ctx.size());
+        StringBuilder sb = new StringBuilder(512);
+        sb.append("[");
+        for (int i = 0; i < k; i++) {
+            Statement s = ctx.get(i);
+            if (i > 0) sb.append(", ");
+            sb.append("{k=").append(stableStmtKey(s)).append(", t=").append(preview(s == null ? "" : s.text, perItemMax)).append("}");
+        }
+        if (ctx.size() > k) sb.append(", … +").append(ctx.size() - k);
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private static String previewList(List<String> xs, int n, int perItemMax) {
+        if (xs == null || xs.isEmpty()) return "[]";
+        int k = Math.min(n, xs.size());
+        StringBuilder sb = new StringBuilder(512);
+        sb.append("[");
+        for (int i = 0; i < k; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append("'").append(preview(xs.get(i), perItemMax)).append("'");
+        }
+        if (xs.size() > k) sb.append(", … +").append(xs.size() - k);
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private static String topCandidatesSummary(List<Candidate> evaluated, int n) {
+        if (evaluated == null || evaluated.isEmpty()) return "[]";
+        ArrayList<Candidate> xs = new ArrayList<>(evaluated);
+        xs.sort((a, b) -> Double.compare(
+                b == null ? Double.NEGATIVE_INFINITY : b.score,
+                a == null ? Double.NEGATIVE_INFINITY : a.score));
+
+        int k = Math.min(n, xs.size());
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("[");
+        for (int i = 0; i < k; i++) {
+            Candidate c = xs.get(i);
+            if (i > 0) sb.append(", ");
+            CandidateEvaluator.Evaluation ev = (c == null) ? null : c.evaluation;
+
+            sb.append("{s=").append(fmt(c == null ? 0 : c.score))
+                    .append(", eff=").append(fmt(ev == null ? 0.0 : ev.effectiveScore()))
+                    .append(", v=").append(ev != null && ev.valid ? 1 : 0)
+                    .append(", g=").append(ev == null ? "0" : fmt(ev.groundedness))
+                    .append(", cs=").append(ev == null ? "0" : fmt(ev.contextSupport))
+                    .append(", cov=").append(ev == null ? "0" : fmt(ev.coverage))
+                    .append(", st=").append(ev == null ? "0" : fmt(ev.structureScore))
+                    .append(", r=").append(ev == null ? "0" : fmt(ev.contradictionRisk))
+                    .append("}");
+        }
+        if (xs.size() > k) sb.append(", … +").append(xs.size() - k);
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private static Map<String, String> stableSmallMap(Map<String, String> in, int maxKeys) {
+        if (in == null || in.isEmpty()) return Map.of();
+        ArrayList<String> ks = new ArrayList<>(in.keySet());
+        ks.sort(String::compareTo);
+        int k = Math.min(maxKeys, ks.size());
+        LinkedHashMap<String, String> out = new LinkedHashMap<>(k);
+        for (int i = 0; i < k; i++) {
+            String key = ks.get(i);
+            out.put(key, in.get(key));
+        }
+        if (ks.size() > k) out.put("…", "+" + (ks.size() - k) + " keys");
+        return out;
+    }
+
+    // =====================================================================
+    // Internal helpers (no hardcode responses)
+    // =====================================================================
+
+    private static final class Drafts {
+        private Drafts() {}
+
+        static List<String> sanitize(List<String> drafts, int minCount) {
+            if (drafts == null || drafts.isEmpty()) return List.of();
+
+            LinkedHashSet<String> set = new LinkedHashSet<>();
+            for (String d : drafts) {
+                if (d == null) continue;
+                String s = d.trim();
+                if (s.isEmpty()) continue;
+                set.add(s);
+            }
+
+            if (set.isEmpty()) return List.of();
+
+            ArrayList<String> out = new ArrayList<>(set);
+
+            int target = Math.max(2, Math.min(Math.max(2, minCount), 12));
+            if (out.size() >= target) return out;
+
+            int i = 0;
+            while (out.size() < target && out.size() < 64) {
+                out.add(out.get(i % out.size()));
+                i++;
+                if (i > 256) break;
+            }
+            return out;
+        }
+    }
+
+    private static final class RetrievalBundle {
+        final List<Statement> rawEvidence;
+        final List<Statement> rerankedContext;
+        final List<Statement> compressedContext;
+        final Double traceQuality;
+
+        RetrievalBundle(List<Statement> rawEvidence, List<Statement> rerankedContext, List<Statement> compressedContext, Double traceQuality) {
+            this.rawEvidence = rawEvidence == null ? List.of() : rawEvidence;
+            this.rerankedContext = rerankedContext == null ? List.of() : rerankedContext;
+            this.compressedContext = compressedContext == null ? List.of() : compressedContext;
+            this.traceQuality = traceQuality;
+        }
+
+        RetrievalBundle withMerged(List<Statement> raw, List<Statement> reranked, List<Statement> compressed) {
+            return new RetrievalBundle(raw, reranked, compressed, traceQuality);
+        }
+    }
 
     private interface QueryProvider {
         List<String> queries(String userText, ThoughtState state);
 
         static QueryProvider userText() {
-            return (u, s) -> u == null || u.isBlank() ? List.of() : List.of(u);
+            return (userText, state) -> {
+                if (userText == null || userText.isBlank()) return List.of();
+                return List.of(userText.trim());
+            };
         }
 
         static QueryProvider intentName() {
-            return (u, s) -> (s == null || s.intent == null) ? List.of() : List.of(s.intent.name());
+            return (userText, state) -> {
+                Intent it = (state == null) ? null : state.intent;
+                if (it == null) return List.of();
+                if (it == Intent.UNKNOWN) return List.of(); // FIX: do not poison retrieval
+                String name = it.name();
+                if (name == null || name.isBlank()) return List.of();
+                return List.of(name);
+            };
         }
 
-        static QueryProvider bestTerms(int maxTerms, int minLen) {
-            int mt = Math.max(1, maxTerms);
-            int ml = Math.max(2, minLen);
-            return (u, s) -> {
-                Candidate best = (s == null) ? null : s.bestSoFar;
+        static QueryProvider bestTerms(int maxTerms, int minBestScoreTokens) {
+            final int mt = Math.max(1, maxTerms);
+            return (userText, state) -> {
+                Candidate best = (state == null) ? null : state.bestSoFar;
+                CandidateEvaluator.Evaluation ev = (state == null) ? null : state.bestEvaluation;
+
+                // FIX: don't derive from bad/invalid bestSoFar
                 if (best == null || best.text == null || best.text.isBlank()) return List.of();
-                return tokens(best.text).stream().filter(t -> t.length() >= ml).limit(mt).toList();
+                if (ev == null || !ev.valid) return List.of();
+
+                Set<String> tok = tokens(best.text);
+                if (tok.size() < Math.max(3, minBestScoreTokens)) return List.of();
+
+                ArrayList<String> out = new ArrayList<>(Math.min(mt, tok.size()));
+                int i = 0;
+                for (String t : tok) {
+                    if (t.length() < 4) continue;
+                    out.add(t);
+                    if (++i >= mt) break;
+                }
+                return out;
             };
         }
     }
 
-    private static final class Drafts {
-        static List<String> sanitize(List<String> drafts, int limit) {
-            int lim = Math.max(1, limit);
-            if (drafts == null || drafts.isEmpty()) return List.of("");
-
-            LinkedHashSet<String> uniq = new LinkedHashSet<>();
-            for (String d : drafts) {
-                if (d == null) continue;
-                String s = d.trim();
-                if (s.isEmpty()) continue;
-                uniq.add(s);
-                if (uniq.size() >= lim) break;
-            }
-            return uniq.isEmpty() ? List.of("") : new ArrayList<>(uniq);
-        }
-    }
-
     private interface StopRule {
-        boolean shouldStop(ThoughtState state, Candidate best, int stagnation);
+        boolean shouldStop(ThoughtState state, Candidate globalBest, int stagnation);
+        default String name() { return getClass().getSimpleName(); }
 
         static StopRule targetScore(double target) {
-            return (s, b, stg) -> b != null && b.score >= target;
+            return new StopRule() {
+                @Override public boolean shouldStop(ThoughtState state, Candidate best, int stg) {
+                    return best != null && best.score >= target;
+                }
+                @Override public String name() { return "targetScore"; }
+            };
         }
 
         static StopRule patience(int patience) {
-            return (s, b, stg) -> stg >= patience;
-        }
-    }
-
-    private record RetrievalBundle(
-            List<Statement> rawEvidence,
-            List<Statement> rerankedContext,
-            List<Statement> compressedContext,
-            Double traceQuality
-    ) {
-        RetrievalBundle withMerged(List<Statement> raw, List<Statement> reranked, List<Statement> compressed) {
-            return new RetrievalBundle(raw, reranked, compressed, traceQuality);
+            final int p = Math.max(0, patience);
+            return new StopRule() {
+                @Override public boolean shouldStop(ThoughtState state, Candidate best, int stg) {
+                    return stg > p;
+                }
+                @Override public String name() { return "patience"; }
+            };
         }
     }
 }

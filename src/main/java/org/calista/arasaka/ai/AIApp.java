@@ -7,39 +7,81 @@ import org.calista.arasaka.ai.core.AIComposer;
 import org.calista.arasaka.ai.events.AIEvent;
 import org.calista.arasaka.ai.learn.Learner;
 import org.calista.arasaka.ai.learn.impl.AdvancedLearner;
-import org.calista.arasaka.ai.think.engine.ThoughtCycleEngine;
+import org.calista.arasaka.ai.think.Think;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
 import org.calista.arasaka.ai.tokenizer.impl.AdvancedTokenizer;
-import org.calista.arasaka.ai.tokenizer.impl.HybridTokenizer;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Scanner;
 
+/**
+ * AIApp — interactive console runner.
+ *
+ * Updated lifecycle:
+ *  1) build kernel (no bootstrap inside build)
+ *  2) kernel.bootstrap()
+ *  3) compose Think + Learner
+ *  4) run loop
+ *  5) close Think (owns eval pool) + Kernel (owns JS context)
+ */
 public final class AIApp {
+
     private static final Logger log = LogManager.getLogger(AIApp.class);
-    AIKernel kernel;
-    Tokenizer tokenizer;
-    AIComposer AIComposer;
-    ThoughtCycleEngine thoughtCycleEngine;
-    Learner learner;
+
+    private Path cfgPath;
+    private AIKernel kernel;
+    private Tokenizer tokenizer;
+    private AIComposer composer;
+    private Think think;
+    private Learner learner;
 
     public static void main(String[] args) throws Exception {
-        new AIApp();
+        new AIApp().run();
     }
 
-    AIApp() throws IOException {
-        Path cfg = Path.of("config/config.json");
-        kernel = AIKernel.boot(cfg);
-        tokenizer = new AdvancedTokenizer();
-        AIComposer = new AIComposer(this);
-        thoughtCycleEngine = AIComposer.buildEngine(kernel, tokenizer);
-        learner = new AdvancedLearner(kernel.knowledge(), tokenizer, kernel.config().learning.newStatementWeight, kernel.config().learning.reinforceStep);
+    public AIApp() {
+        this.cfgPath = Path.of("config/config.json");
+    }
 
+    public void run() throws IOException {
+        try {
+            // 1) Build kernel container (loads/creates config, init IO/stores, NO corpora load yet)
+            kernel = AIKernel.builder()
+                    .configRoot(Path.of("."))
+                    .enableJs(true)
+                    .allowHostAccess(false)
+                    .allowIO(false)
+                    .build(cfgPath);
+
+            // 2) Explicit bootstrap step (loads corpora into KB)
+            kernel.bootstrap();
+
+            tokenizer = new AdvancedTokenizer();
+
+            composer = new AIComposer(this);
+
+            // 3) Compose Think orchestrator (Think owns its eval pool unless injected)
+            think = composer.buildEngine(kernel, tokenizer);
+
+            learner = new AdvancedLearner(
+                    kernel.knowledge(),
+                    tokenizer,
+                    kernel.config().learning.newStatementWeight,
+                    kernel.config().learning.reinforceStep
+            );
+
+            runConsoleLoop();
+        } finally {
+            shutdown();
+        }
+    }
+
+    private void runConsoleLoop() throws IOException {
         String sessionId = "sess-" + Long.toHexString(System.nanoTime());
         long turns = 0;
 
-        log.info("AI started. knowledge.size=" + kernel.knowledge().size());
+        log.info("AI started. knowledge.size={}", kernel.knowledge().size());
         log.info("Type 'exit' to quit.\n");
 
         try (Scanner sc = new Scanner(System.in)) {
@@ -47,15 +89,20 @@ public final class AIApp {
                 System.out.print("> ");
                 String user = sc.nextLine();
                 if (user == null) break;
-                if (user.trim().equalsIgnoreCase("exit")) break;
+
+                user = user.trim();
+                if (user.equalsIgnoreCase("exit")) break;
+                if (user.isEmpty()) continue;
 
                 long now = System.currentTimeMillis();
                 kernel.eventStore().append(AIEvent.of("USER", sessionId, user, now));
 
-                long seed = System.nanoTime(); // “живость”: разные траектории поиска/мысли
-                var result = thoughtCycleEngine.think(user, seed);
+                // deterministic per-turn seed source
+                long seed = System.nanoTime();
+                var result = think.think(user, seed);
 
-                kernel.eventStore().append(AIEvent.of("ASSISTANT", sessionId, result.answer, System.currentTimeMillis()));
+                long at = System.currentTimeMillis();
+                kernel.eventStore().append(AIEvent.of("ASSISTANT", sessionId, result.answer, at));
                 System.out.println("\n" + result.answer + "\n");
 
                 // learning
@@ -65,34 +112,44 @@ public final class AIApp {
                     kernel.eventStore().append(AIEvent.of("LEARNING", sessionId, "learned_from_turn", System.currentTimeMillis()));
                 }
 
+                // snapshots
                 turns++;
-                if (turns % kernel.config().knowledge.autoSnapshotEveryTurns == 0) {
+                int every = kernel.config().knowledge.autoSnapshotEveryTurns;
+                if (every > 0 && (turns % every == 0)) {
                     kernel.snapshotStore().save(kernel.knowledge());
                     kernel.eventStore().append(AIEvent.of("SNAPSHOT", sessionId, "saved", System.currentTimeMillis()));
                 }
             }
+
             kernel.snapshotStore().save(kernel.knowledge());
             System.out.println("Bye. Snapshot saved.");
         }
     }
 
-    public AIKernel getKernel() {
-        return kernel;
+    private void shutdown() {
+        // Ensure owned resources are released
+        try {
+            if (think != null) think.close();      // closes owned eval pool (if owned)
+        } catch (Throwable ignored) {}
+
+        try {
+            if (kernel != null) kernel.close();    // closes JS context
+        } catch (Throwable ignored) {}
     }
 
-    public Tokenizer getTokenizer() {
-        return tokenizer;
-    }
+    // ---------------------------------------------------------------------
+    // Accessors (for composer / integrations)
+    // ---------------------------------------------------------------------
 
-    public AIComposer getGraalAIComposer() {
-        return AIComposer;
-    }
+    public AIKernel getKernel() { return kernel; }
 
-    public ThoughtCycleEngine getThoughtCycleEngine() {
-        return thoughtCycleEngine;
-    }
+    public Tokenizer getTokenizer() { return tokenizer; }
 
-    public Learner getLearner() {
-        return learner;
-    }
+    public AIComposer getComposer() { return composer; }
+
+    public Think getThink() { return think; }
+
+    public Learner getLearner() { return learner; }
+
+    public Path getCfgPath() { return cfgPath; }
 }

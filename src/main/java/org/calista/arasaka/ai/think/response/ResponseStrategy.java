@@ -1,6 +1,7 @@
-package org.calista.arasaka.ai.think;
+package org.calista.arasaka.ai.think.response;
 
 import org.calista.arasaka.ai.knowledge.Statement;
+import org.calista.arasaka.ai.think.ThoughtState;
 import org.calista.arasaka.ai.think.intent.Intent;
 
 import java.util.List;
