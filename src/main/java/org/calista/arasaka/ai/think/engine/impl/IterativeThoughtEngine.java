@@ -442,6 +442,9 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
                 List<String> refineQueries = deriveRefineQueries(q0, state, refineRounds, refineQueryBudget);
 
+                // expose deterministic retrieval queries for telemetry and final trace
+                state.lastQueries = refineQueries;
+
                 // retrieve
                 int k = explore ? (int) Math.ceil(retrieveK * exploreRetrieveKMult) : retrieveK;
                 k = Math.max(1, k);
@@ -454,6 +457,9 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
                 // rerank + compress
                 List<Statement> context = rerankAndCompress(q0, retrieved, k);
+
+                // expose explicit context snapshot to final ResponseStrategy
+                state.lastContext = context;
 
                 // generate drafts
                 List<String> drafts = generateDraftsDeterministic(q0, context, state, draftsPerIteration);
@@ -686,19 +692,36 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
     // --------- Draft generation / evaluation ---------
 
     private List<String> generateDraftsDeterministic(String q0, List<Statement> ctx, ThoughtState state, int drafts) {
-        if (generator == null) return List.of("");
+        int n = Math.max(1, drafts);
 
-        ArrayList<String> out = new ArrayList<>(drafts);
-        for (int i = 0; i < drafts; i++) {
-            ThoughtState s2 = state.copyForDraft(i);
-            s2.draftIndex = i;
-            s2.seed = mix(state.seed, i * 0x9E3779B97F4A7C15L);
+        // Generator path (preferred: BeamSearch/TensorFlow).
+        if (generator != null) {
+            ArrayList<String> out = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) {
+                ThoughtState s2 = state.copyForDraft(i);
+                s2.draftIndex = i;
+                s2.seed = mix(state.seed, i * 0x9E3779B97F4A7C15L);
+                try {
+                    String d = generator.generate(q0, ctx, s2);
+                    out.add(d == null ? "" : d);
+                } catch (Exception e) {
+                    log.warn("gen.fail i={}", i, e);
+                    out.add("");
+                }
+            }
+            return out;
+        }
 
+        // Fallback path (no generator): use ResponseStrategy deterministically.
+        ArrayList<String> out = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
             try {
-                String d = generator.generate(q0, ctx, s2);
+                ThoughtState s2 = state.copyForDraft(i);
+                s2.draftIndex = i;
+                String d = strategy.generate(q0, ctx, s2);
                 out.add(d == null ? "" : d);
             } catch (Exception e) {
-                log.warn("gen.fail i={}", i, e);
+                log.warn("strategy.gen.fail i={}", i, e);
                 out.add("");
             }
         }
@@ -709,6 +732,7 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         if (drafts == null || drafts.isEmpty()) return List.of(Candidate.empty(q0));
 
         // evaluation parallelism
+
         int par = Math.min(evalParallelism, drafts.size());
         if (par <= 1) {
             ArrayList<Candidate> out = new ArrayList<>(drafts.size());
@@ -891,23 +915,74 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
         if (best == null || best.evaluation == null) return;
         if (!best.evaluation.valid) return;
 
-        // optional groundedness gate
+        // groundedness gate
         if (best.evaluation.groundedness < ltmWriteMinGroundedness) return;
-
         if (ctx == null || ctx.isEmpty()) return;
 
-        // store top-K evidence ids into LTM
-        int k = Math.min(ltmRecallK, ctx.size());
-        long tick = ltmTick.get();
+        // ВАЖНО: tick уже увеличен выше (ltmTick.incrementAndGet(); ltmDecay(); maybeWriteLtm(...))
+        // Тут не надо увеличивать второй раз — берём текущее значение.
+        final long tick = ltmTick.get();
+
+        // Пока отдельного ltmWriteK нет — используем ltmRecallK как fallback.
+        final int k = Math.min(Math.max(1, ltmRecallK), ctx.size());
 
         for (int i = 0; i < k; i++) {
             Statement st = ctx.get(i);
             if (st == null) continue;
-            if (st.id == null || st.id.isBlank()) continue;
 
-            ltm.put(st.id, new LtmCell(st.id, tick, ltmPromotionBoost));
+            String id = st.id;
+            if (id == null || id.isBlank()) continue;
+
+            // top evidence важнее (детерминированно)
+            double posW = 1.0 / (1.0 + i); // 1.0, 0.5, 0.33...
+            double boost = ltmPromotionBoost * posW;
+
+            // детерминированные токены (без магии)
+            final Set<String> toks = ltmTokens(st, q0);
+
+            ltm.compute(id, (key, old) -> {
+                if (old == null) {
+                    return new LtmCell(st, toks, tick, boost);
+                }
+
+                // merge tokens безопасно (old.tokens может быть Set.of())
+                HashSet<String> merged = new HashSet<>(Math.max(16, (old.tokens == null ? 0 : old.tokens.size()) + toks.size()));
+                if (old.tokens != null && !old.tokens.isEmpty()) merged.addAll(old.tokens);
+                if (!toks.isEmpty()) merged.addAll(toks);
+
+                // создаём новый cell (stmt/tokens у вас final)
+                return new LtmCell(
+                        st,                    // обновляем на актуальный Statement
+                        merged,
+                        tick,                  // lastSeenTick
+                        old.score + boost      // накапливаем score
+                );
+            });
         }
     }
+
+    private Set<String> ltmTokens(Statement st, String q0) {
+        HashSet<String> out = new HashSet<>(32);
+
+        // 1) токены из факта
+        if (st != null && st.text != null && !st.text.isBlank()) {
+            addTokens(out, st.text);
+        }
+
+        // 2) опционально токены из вопроса (связка "вопрос -> факт")
+        if (q0 != null && !q0.isBlank()) {
+            addTokens(out, q0);
+        }
+
+        return out.isEmpty() ? Set.of() : out;
+    }
+
+    private void addTokens(Set<String> out, String text) {
+        if (text == null || text.isBlank()) return;
+        var m = knobs.WORD.matcher(text.toLowerCase(Locale.ROOT));
+        while (m.find()) out.add(m.group());
+    }
+
 
 
     // --------- Utilities ---------
@@ -1069,11 +1144,15 @@ public final class IterativeThoughtEngine implements ThoughtCycleEngine {
 
     private static final class LtmCell {
         final String id;
+        final Statement stmt;
+        final Set<String> tokens;
         long lastSeenTick;
         double score;
 
-        LtmCell(String id, long lastSeenTick, double score) {
-            this.id = id;
+        LtmCell(Statement stmt, Set<String> tokens, long lastSeenTick, double score) {
+            this.stmt = stmt;
+            this.id = (stmt == null || stmt.id == null) ? "" : stmt.id;
+            this.tokens = (tokens == null) ? Set.of() : tokens;
             this.lastSeenTick = lastSeenTick;
             this.score = score;
         }

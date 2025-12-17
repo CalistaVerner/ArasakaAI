@@ -7,34 +7,24 @@ import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
 
 import java.util.*;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Advanced deterministic evaluator:
- * - structure contract (sections) + formatting sanity
+ * Advanced deterministic evaluator (enterprise-grade):
+ * - schema-aware structure contract (driven by state.tags, no hard-coded domains)
  * - groundedness aggregation over context statements
  * - query coverage (does it address user input)
  * - novelty / unsupported-assertion risk (tokens not backed by context)
  * - repetition / low-information penalties
  * - length/verbosity guardrails
  *
- * No randomness, no domain hard-coded phrases. Only general heuristics/policy thresholds.
- *
- * Supports sectioning contracts:
- *  - Numbered sections: 1) ... 2) ... 3) ... (ANY 3+ numeric sections)
- *  - Markdown: ## / ### headers (>= 3 headers)
- *
- * IMPORTANT: No-context mode:
- *  - When context is empty, do NOT punish groundedness/novelty harshly.
- *  - Instead punish echoing the question and repetition.
+ * No randomness. No domain phrases. Only general heuristics and tunable thresholds via tags.
  */
 public final class BaseCandidateEvaluator implements CandidateEvaluator {
 
-    // --- policy thresholds (tunable) ---
+    // --- defaults (can be overridden by state.tags) ---
     private final double minGroundedness;
     private final double maxContradictionRisk;
-
     private final double minQueryCoverage;
     private final double maxNovelty;
     private final double maxRepetition;
@@ -45,15 +35,10 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
     private final Tokenizer tokenizer;
     private final TokenOverlapScorer overlapScorer;
 
-    // Numbered section markers at line start (accept any 1..99).
-    private static final Pattern SECTION_MARKERS = Pattern.compile("(?m)^(\\s*)(\\d{1,2})\\)\\s+");
-    private static final Pattern LEGACY_1 = Pattern.compile("(?m)^\\s*1\\)\\s+");
-    private static final Pattern LEGACY_2 = Pattern.compile("(?m)^\\s*2\\)\\s+");
-    private static final Pattern LEGACY_3 = Pattern.compile("(?m)^\\s*3\\)\\s+");
-
-    // Markdown section markers (line-start headers)
+    // Numbered sections: "1) ..." at line start (1..99)
+    private static final Pattern NUMBERED_SECTION = Pattern.compile("(?m)^\\s*\\d{1,2}\\)\\s+");
+    // Markdown headers: ## / ###
     private static final Pattern MD_HEADER = Pattern.compile("(?m)^\\s*#{2,3}\\s+.+$");
-
     private static final Pattern BULLETISH = Pattern.compile("(?m)^\\s*([-*•]|\\d+\\.|\\d+\\))\\s+");
 
     public BaseCandidateEvaluator(Tokenizer tokenizer) {
@@ -100,30 +85,29 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
     public Evaluation evaluate(String userText, List<Statement> context, ThoughtState state, String draft) {
         final long t0 = System.nanoTime();
 
-        final String q = userText == null ? "" : userText.trim();
-        final String a = draft == null ? "" : draft.trim();
-        final List<Statement> ctx = context == null ? List.of() : context;
+        final String q = (userText == null) ? "" : userText.trim();
+        final String a = (draft == null) ? "" : draft.trim();
+        final List<Statement> ctx = (context == null) ? List.of() : context;
 
-        final int tokens = safeTokenCount(a);
+        final int tokenCount = safeTokenCount(a);
 
-        if (a.isEmpty()) {
-            return invalid(-1.0, "err=empty", tokens, System.nanoTime() - t0);
-        }
-        if (a.length() > maxCharsHard) {
-            return invalid(-0.6, "err=too_long_hard;len=" + a.length(), tokens, System.nanoTime() - t0);
-        }
+        if (a.isEmpty()) return invalid(-1.0, "err=empty", tokenCount, System.nanoTime() - t0);
+        if (a.length() > maxCharsHard) return invalid(-0.6, "err=too_long_hard;len=" + a.length(), tokenCount, System.nanoTime() - t0);
 
-        // ---- 1) Structure quality ----
+        // ---- policy overrides from tags (enterprise control-plane) ----
+        Policy p = policyFromState(state);
+
+        // ---- 1) Structure ----
         Structure s = structureOf(a);
-        double structureScore = structureScoreOf(s); // 0..1
+        double structureScore = structureScoreOf(s);
 
-        // ---- No-context mode ----
+        // ---- no-context mode ----
         if (ctx.isEmpty()) {
-            double queryCoverage = queryCoverage(q, a);
+            double qc = queryCoverage(q, a);
             Repetition rep = repetition(a);
-            double echoPenalty = echoPenalty(q, a);
+            double echo = echoPenalty(q, a);
 
-            // In no-context mode, schema isn't mandatory; keep soft penalty only.
+            // no-context: structure is soft, but we still keep it as a quality hint
             double structureSoft = clamp01(s.structurePenalty) * 0.25;
 
             double verbosityPenalty = 0.0;
@@ -132,32 +116,31 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
                 verbosityPenalty = clamp01(over) * 0.35;
             }
 
-            double stylePenalty = structureSoft + verbosityPenalty + rep.repetitionPenalty + echoPenalty;
+            double stylePenalty = structureSoft + verbosityPenalty + rep.repetitionPenalty + echo;
 
-            // Treat “risk” as “uselessness/loop risk” here.
             double contradictionRisk = clamp01(
                     0.10
-                            + 0.35 * echoPenalty
+                            + 0.35 * echo
                             + 0.25 * rep.repetition
                             + 0.10 * (s.hasAllSections ? 0.0 : 1.0)
             );
 
             boolean valid =
-                    queryCoverage >= (minQueryCoverage * 0.50)
-                            && echoPenalty <= 0.60
-                            && rep.repetition <= maxRepetition
+                    qc >= (p.minQueryCoverage * 0.50)
+                            && echo <= 0.60
+                            && rep.repetition <= p.maxRepetition
                             && a.length() <= maxCharsHard;
 
             double score =
-                    (0.75 * queryCoverage)
+                    (0.75 * qc)
                             - (0.95 * contradictionRisk)
                             - (0.90 * stylePenalty)
                             + (0.15 * structureScore)
                             + (0.10 * s.actionability);
 
             String telemetry = "noctx"
-                    + ";qc=" + fmt2(queryCoverage)
-                    + ";echo=" + fmt2(echoPenalty)
+                    + ";qc=" + fmt2(qc)
+                    + ";echo=" + fmt2(echo)
                     + ";rep=" + fmt2(rep.repetition)
                     + ";sec=" + s.sectionCount
                     + ";md=" + s.mdHeaders
@@ -167,40 +150,28 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
             Evaluation ev = new Evaluation();
             ev.score = score;
             ev.valid = valid;
-
             ev.groundedness = 0.0;
             ev.contradictionRisk = contradictionRisk;
             ev.structureScore = structureScore;
-
             ev.repetition = rep.repetition;
             ev.novelty = 0.0;
-            ev.coherence = queryCoverage; // cheap proxy in noctx mode
-
+            ev.coherence = qc;
             ev.critique = telemetry;
             ev.validationNotes = telemetry;
             ev.syncNotes();
             return ev;
         }
 
-        // ---- Context mode ----
-        if (a.length() < minChars) {
-            return invalid(-0.8, "err=too_short;len=" + a.length(), tokens, System.nanoTime() - t0);
-        }
+        // ---- context mode ----
+        if (a.length() < minChars) return invalid(-0.8, "err=too_short;len=" + a.length(), tokenCount, System.nanoTime() - t0);
 
-        // ---- 2) Groundedness to context ----
         GroundingAgg g = groundednessAgg(a, ctx);
         double groundedness = g.groundedness;
 
-        // ---- 3) Query coverage ----
-        double queryCoverage = queryCoverage(q, a);
-
-        // ---- 4) Novelty vs context ----
-        Novelty n = noveltyVsContext(a, ctx);
-
-        // ---- 5) Repetition ----
+        double qc = queryCoverage(q, a);
+        Novelty nov = noveltyVsContext(a, ctx);
         Repetition rep = repetition(a);
 
-        // ---- 6) Contradiction / hallucination risk ----
         double numericDensity = (double) countDigits(a) / (double) Math.max(1, a.length());
         double punctuationDensity = (double) countPunctuation(a) / (double) Math.max(1, a.length());
 
@@ -208,50 +179,47 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
                 0.15
                         + 0.40 * clamp01(numericDensity / 0.18)
                         + 0.15 * clamp01(punctuationDensity / 0.22)
-                        + 0.45 * clamp01(n.novelty / Math.max(1e-9, maxNovelty)) * 0.5
+                        + 0.45 * clamp01(nov.novelty / Math.max(1e-9, p.maxNovelty)) * 0.5
                         + (s.hasAllSections ? 0.0 : 0.10)
                         - 0.55 * groundedness
         );
 
-        // ---- 7) Style / verbosity ----
         double verbosityPenalty = 0.0;
         if (a.length() > maxCharsSoft) {
             double over = (double) (a.length() - maxCharsSoft) / (double) Math.max(1, (maxCharsHard - maxCharsSoft));
             verbosityPenalty = clamp01(over) * 0.35;
         }
 
-        double stylePenalty = 0.0;
-        stylePenalty += s.structurePenalty;
-        stylePenalty += verbosityPenalty;
-        stylePenalty += rep.repetitionPenalty;
+        double stylePenalty = s.structurePenalty + verbosityPenalty + rep.repetitionPenalty;
 
-        // ---- 8) Validity decision ----
+        // schema requirement driven by response.sections
+        boolean mustHaveSections = p.requireSections;
+
         boolean valid =
-                s.hasAllSections
-                        && structureScore >= 0.35
-                        && groundedness >= minGroundedness
-                        && contradictionRisk <= maxContradictionRisk
-                        && queryCoverage >= minQueryCoverage
-                        && n.novelty <= maxNovelty
-                        && rep.repetition <= maxRepetition
+                (!mustHaveSections || s.hasAllSections)
+                        && (!mustHaveSections || structureScore >= 0.35)
+                        && groundedness >= p.minGroundedness
+                        && contradictionRisk <= p.maxContradictionRisk
+                        && qc >= p.minQueryCoverage
+                        && nov.novelty <= p.maxNovelty
+                        && rep.repetition <= p.maxRepetition
                         && a.length() <= maxCharsHard;
 
-        // ---- 9) Score ----
         double score =
                 (0.50 * groundedness)
-                        + (0.25 * queryCoverage)
+                        + (0.25 * qc)
                         + (0.15 * structureScore)
                         + (0.10 * s.actionability)
                         - (0.55 * contradictionRisk)
                         - (0.55 * stylePenalty)
-                        - (0.35 * n.novelty)
+                        - (0.35 * nov.novelty)
                         - (0.35 * rep.repetition);
 
-        if (!s.hasAllSections) score -= 0.35;
+        if (mustHaveSections && !s.hasAllSections) score -= 0.35;
 
-        String telemetry = "qc=" + fmt2(queryCoverage)
+        String telemetry = "qc=" + fmt2(qc)
                 + ";g=" + fmt2(groundedness)
-                + ";nov=" + fmt2(n.novelty)
+                + ";nov=" + fmt2(nov.novelty)
                 + ";rep=" + fmt2(rep.repetition)
                 + ";sec=" + s.sectionCount
                 + ";md=" + s.mdHeaders
@@ -262,84 +230,107 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
         Evaluation ev = new Evaluation();
         ev.score = score;
         ev.valid = valid;
-
         ev.groundedness = groundedness;
         ev.contradictionRisk = contradictionRisk;
         ev.structureScore = structureScore;
-
         ev.repetition = rep.repetition;
-        ev.novelty = n.novelty;
-
-        // coherence proxy: groundedness + queryCoverage weighted
-        ev.coherence = clamp01(0.60 * groundedness + 0.40 * queryCoverage);
-
-        // critique should be short & generator-safe; telemetry kept in validationNotes
+        ev.novelty = nov.novelty;
+        ev.coherence = clamp01(0.60 * groundedness + 0.40 * qc);
         ev.critique = telemetry;
         ev.validationNotes = telemetry;
-
         ev.syncNotes();
         return ev;
+    }
+
+    // -------------------- policy --------------------
+
+    private record Policy(
+            double minGroundedness,
+            double maxContradictionRisk,
+            double minQueryCoverage,
+            double maxNovelty,
+            double maxRepetition,
+            boolean requireSections
+    ) {}
+
+    private Policy policyFromState(ThoughtState state) {
+        double gMin = minGroundedness;
+        double riskMax = maxContradictionRisk;
+        double qcMin = minQueryCoverage;
+        double novMax = maxNovelty;
+        double repMax = maxRepetition;
+
+        boolean requireSections = true;
+
+        Map<String, String> tags = (state == null ? null : state.tags);
+        if (tags != null && !tags.isEmpty()) {
+            gMin = clamp01(readDouble(tags, "eval.grounded.min", gMin));
+            riskMax = clamp01(readDouble(tags, "eval.risk.max", riskMax));
+            qcMin = clamp01(readDouble(tags, "eval.qc.min", qcMin));
+            novMax = clamp01(readDouble(tags, "eval.novelty.max", novMax));
+            repMax = clamp01(readDouble(tags, "eval.rep.max", repMax));
+
+            String sections = readString(tags, "response.sections", "");
+            if (!sections.isBlank()) {
+                String s = sections.toLowerCase(Locale.ROOT);
+                if (s.equals("summary") || (!s.contains("evidence") && !s.contains("actions"))) {
+                    requireSections = false;
+                }
+            }
+        }
+
+        return new Policy(gMin, riskMax, qcMin, novMax, repMax, requireSections);
+    }
+
+    private static double readDouble(Map<String, String> tags, String key, double def) {
+        String v = tags.get(key);
+        if (v == null || v.isBlank()) return def;
+        try { return Double.parseDouble(v.trim()); }
+        catch (Exception ignore) { return def; }
+    }
+
+    private static String readString(Map<String, String> tags, String key, String def) {
+        String v = tags.get(key);
+        return (v == null) ? def : v;
     }
 
     // -------------------- structure --------------------
 
     private record Structure(
             boolean hasAllSections,
-            boolean has1,
-            boolean has2,
-            boolean has3,
+            int numberedSections,
             int mdHeaders,
-            boolean usesMarkdown,
             double structurePenalty,
             double actionability,
             int sectionCount
     ) {}
 
     private static Structure structureOf(String answer) {
-        boolean has1 = LEGACY_1.matcher(answer).find();
-        boolean has2 = LEGACY_2.matcher(answer).find();
-        boolean has3 = LEGACY_3.matcher(answer).find();
+        int numbered = countMatches(NUMBERED_SECTION, answer);
+        int md = countMatches(MD_HEADER, answer);
+        int bullets = countMatches(BULLETISH, answer);
 
-        int legacyCount = 0;
-        Matcher m = SECTION_MARKERS.matcher(answer);
-        while (m.find()) legacyCount++;
+        boolean hasAll = (numbered >= 3) || (md >= 3);
 
-        boolean legacyAll = legacyCount >= 3;
-
-        int mdHeaders = 0;
-        Matcher mh = MD_HEADER.matcher(answer);
-        while (mh.find()) mdHeaders++;
-
-        boolean mdAll = mdHeaders >= 3;
-        boolean hasAll = legacyAll || mdAll;
-        boolean usesMarkdown = (!legacyAll) && mdAll;
-
-        double p = 0.0;
-        if (!hasAll) {
-            p += 0.70;
-        } else {
-            if (legacyAll) {
-                if (legacyCount < 3) p += 0.20;
-            } else {
-                if (mdHeaders < 3) p += 0.20;
-            }
+        double penalty = hasAll ? 0.0 : 0.70;
+        // slight penalty if barely meets threshold (keeps it honest)
+        if (hasAll) {
+            if (numbered > 0 && numbered < 3) penalty += 0.20;
+            if (md > 0 && md < 3) penalty += 0.20;
         }
 
-        int bullets = 0;
-        Matcher b = BULLETISH.matcher(answer);
-        while (b.find()) bullets++;
-
         double actionability = clamp01(bullets / 8.0);
-        int sectionCount = legacyAll ? legacyCount : mdHeaders;
+        int sectionCount = (numbered >= 3) ? numbered : md;
 
-        return new Structure(
-                hasAll,
-                has1, has2, has3,
-                mdHeaders, usesMarkdown,
-                clamp01(p),
-                actionability,
-                sectionCount
-        );
+        return new Structure(hasAll, numbered, md, clamp01(penalty), actionability, sectionCount);
+    }
+
+    private static int countMatches(Pattern p, String s) {
+        if (s == null || s.isBlank()) return 0;
+        int c = 0;
+        var m = p.matcher(s);
+        while (m.find()) c++;
+        return c;
     }
 
     private static double structureScoreOf(Structure s) {
@@ -352,18 +343,10 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
 
     // -------------------- groundedness --------------------
 
-    private record GroundingAgg(
-            double groundedness,
-            int bestIdx,
-            double bestScore,
-            int topK,
-            double topKMean
-    ) {}
+    private record GroundingAgg(double groundedness, int bestIdx, double bestScore, int topK, double topKMean) {}
 
     private GroundingAgg groundednessAgg(String answer, List<Statement> ctx) {
-        if (ctx == null || ctx.isEmpty()) {
-            return new GroundingAgg(0.0, -1, 0.0, 0, 0.0);
-        }
+        if (ctx == null || ctx.isEmpty()) return new GroundingAgg(0.0, -1, 0.0, 0, 0.0);
 
         double best = 0.0;
         int bestIdx = -1;
@@ -379,10 +362,7 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
             if (!Double.isFinite(s)) s = 0.0;
             s = clamp01(s);
 
-            if (s > best) {
-                best = s;
-                bestIdx = i;
-            }
+            if (s > best) { best = s; bestIdx = i; }
 
             for (int j = 0; j < K; j++) {
                 if (s > top[j]) {
@@ -399,7 +379,7 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
             if (v > 0) { sum += v; cnt++; }
         }
 
-        double mean = cnt == 0 ? 0.0 : (sum / cnt);
+        double mean = (cnt == 0) ? 0.0 : (sum / cnt);
         double agg = clamp01(0.70 * best + 0.30 * mean);
 
         return new GroundingAgg(agg, bestIdx, best, cnt, mean);
@@ -427,9 +407,7 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
         }
 
         double novelty = clamp01((double) unsupported / (double) Math.max(1, aTok.size()));
-        double support = 1.0 - novelty;
-
-        return new Novelty(novelty, support, unsupported, aTok.size());
+        return new Novelty(novelty, 1.0 - novelty, unsupported, aTok.size());
     }
 
     // -------------------- query coverage --------------------
@@ -440,7 +418,6 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
 
         List<String> qTok = tokenize(query);
         List<String> aTok = tokenize(answer);
-
         if (qTok.isEmpty() || aTok.isEmpty()) return 0.0;
 
         Set<String> aSet = new HashSet<>(aTok);
@@ -472,6 +449,7 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
 
     private double echoPenalty(String q, String a) {
         if (q == null || q.isBlank() || a == null || a.isBlank()) return 0.0;
+
         List<String> qt = tokenize(q);
         List<String> at = tokenize(a);
         if (qt.isEmpty() || at.isEmpty()) return 0.0;
@@ -492,7 +470,11 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
         if (s == null || s.isBlank()) return List.of();
         List<String> out = tokenizer.tokenize(s);
         if (out == null || out.isEmpty()) return List.of();
-        if (out.size() > 512) return out.subList(0, 512);
+
+        if (out.size() > 512) {
+            // IMPORTANT: subList view is easy to misuse; return a stable copy
+            return new ArrayList<>(out.subList(0, 512));
+        }
         return out;
     }
 
@@ -505,7 +487,7 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
     private int safeTokenCount(String s) {
         if (s == null || s.isBlank()) return 0;
         List<String> t = tokenizer.tokenize(s);
-        return t == null ? 0 : t.size();
+        return (t == null) ? 0 : t.size();
     }
 
     private static int countDigits(String s) {
@@ -537,7 +519,7 @@ public final class BaseCandidateEvaluator implements CandidateEvaluator {
         ev.repetition = 1.0;
         ev.coherence = 0.0;
 
-        ev.critique = note == null ? "" : note;
+        ev.critique = (note == null) ? "" : note;
         ev.validationNotes = ev.critique;
 
         ev.syncNotes();

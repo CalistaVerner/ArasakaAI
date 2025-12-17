@@ -45,9 +45,8 @@ public interface ResponseStrategy {
      * Engine may pass bestCandidate == null.
      */
     default ThoughtResult build(String userText, ThoughtState state, Candidate bestCandidate) {
-        List<Statement> ctx = (bestCandidate != null && bestCandidate.evaluation != null && bestCandidate.evaluation.valid)
-                ? stateContextOrEmpty(state)   // prefer state-owned context if your engine stores it
-                : stateContextOrEmpty(state);
+        // The engine owns retrieval; strategy must only use explicit state snapshot.
+        List<Statement> ctx = stateContextOrEmpty(state);
 
         // Generate final text (legacy)
         String answer = generate(userText, ctx, state);
@@ -69,29 +68,35 @@ public interface ResponseStrategy {
     // --------- helpers (default, no new public types) ---------
 
     /**
-     * If you store context in state in your project, adapt this method.
-     * By default we don't assume state has context.
+     * Explicit context snapshot.
+     * IMPORTANT: do NOT do implicit retrieval here.
      */
     private static List<Statement> stateContextOrEmpty(ThoughtState state) {
-        // ThoughtState in your current project does not expose context.
-        // Keep this as empty to avoid implicit retrieval here.
-        return List.of();
+        if (state == null || state.lastContext == null) return List.of();
+        return state.lastContext;
     }
 
     private static List<String> buildTrace(ThoughtState state, Candidate bestCandidate) {
-        ArrayList<String> t = new ArrayList<>(8);
+        ArrayList<String> t = new ArrayList<>(16);
 
         if (state != null) {
-            t.add("iter=" + state.iteration);
-            t.add("phase=" + state.phase);
-            t.add("diversity=" + state.diversity);
+            // Prefer engine-built trace if present.
+            if (state.trace != null && !state.trace.isEmpty()) {
+                t.addAll(state.trace);
+            } else {
+                t.add("iter=" + state.iteration);
+                t.add("phase=" + state.phase);
+                t.add("diversity=" + state.diversity);
+            }
 
             if (state.tags != null && !state.tags.isEmpty()) {
-                // keep it short; do NOT dump everything (enterprise logs only)
                 t.add("tags.n=" + state.tags.size());
             }
+            if (state.lastQueries != null && !state.lastQueries.isEmpty()) {
+                t.add("queries.n=" + state.lastQueries.size());
+            }
             if (state.lastCritique != null && !state.lastCritique.isBlank()) {
-                t.add("lastCritique=" + safeShort(state.lastCritique, 160));
+                t.add("lastCritique=" + safeShort(state.lastCritique, 180));
             }
         }
 
