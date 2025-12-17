@@ -1,39 +1,53 @@
 package org.calista.arasaka.ai.think.candidate;
 
+/**
+ * Candidate — mutable container for one generated draft inside think-loop.
+ *
+ * Engine expects this object to be mutable:
+ * - seed/iteration/draftIndex are filled by engine
+ * - evaluation/score/critique are filled after evaluator
+ */
 public final class Candidate {
+
+    /** Original normalized user query (for debugging/telemetry). */
+    public final String query;
+
+    /** Draft text (never null). */
     public final String text;
-    public final double score;
 
-    /** Short machine critique for refinement (NO telemetry). */
-    public final String critique;
+    // engine meta
+    public int iteration;
+    public long seed;
+    public int draftIndex;
 
-    /** Full evaluation (may contain telemetry). */
-    public final CandidateEvaluator.Evaluation evaluation;
+    // evaluation result
+    public CandidateEvaluator.Evaluation evaluation;
+    public double score;
+    public String critique;
 
-    /** Optional diagnostics for logs; must NOT be used for retrieval/generation. */
-    public final String diagnostics;
-
-    public Candidate(String text, double score, String critique, CandidateEvaluator.Evaluation evaluation) {
-        this(text, score, critique, evaluation, "");
-    }
-
-    public Candidate(String text, double score, String critique, CandidateEvaluator.Evaluation evaluation, String diagnostics) {
+    public Candidate(String query, String text) {
+        this.query = query == null ? "" : query;
         this.text = text == null ? "" : text;
-        this.score = score;
-        this.critique = critique == null ? "" : critique;
-        this.evaluation = evaluation;
-        this.diagnostics = diagnostics == null ? "" : diagnostics;
+
+        this.iteration = 0;
+        this.seed = 0L;
+        this.draftIndex = 0;
+
+        this.evaluation = null;
+        this.score = 0.0;
+        this.critique = "";
     }
 
-    public static Candidate fromEvaluation(String text, CandidateEvaluator.Evaluation ev) {
-        String shortCrit = CandidateControlSignals.compact(ev);         // <<< ВАЖНО
-        String diag = (ev == null) ? "" : ev.validationNotes; // telemetry остаётся здесь
-        double s = (ev == null) ? Double.NEGATIVE_INFINITY : ev.effectiveScore();
-        return new Candidate(text, s, shortCrit, ev, diag);
+    public static Candidate empty(String query) {
+        Candidate c = new Candidate(query, "");
+        c.score = Double.NEGATIVE_INFINITY;
+        c.critique = "";
+        c.evaluation = null;
+        return c;
     }
 
     @Override
     public String toString() {
-        return "Candidate{score=" + score + ", critique='" + critique + "'}";
+        return "Candidate{score=" + score + ", it=" + iteration + ", d=" + draftIndex + "}";
     }
 }

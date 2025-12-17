@@ -4,9 +4,9 @@ package org.calista.arasaka.ai.think;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.calista.arasaka.ai.retrieve.retriver.Retriever;
-import org.calista.arasaka.ai.think.candidate.impl.CandidateEvaluator;
+import org.calista.arasaka.ai.think.candidate.impl.BaseCandidateEvaluator;
 import org.calista.arasaka.ai.think.engine.impl.IterativeThoughtEngine;
-import org.calista.arasaka.ai.think.intent.impl.IntentDetector;
+import org.calista.arasaka.ai.think.intent.impl.BaseIntentDetector;
 import org.calista.arasaka.ai.think.response.ContextAnswerStrategy;
 import org.calista.arasaka.ai.think.response.ResponseStrategy;
 import org.calista.arasaka.ai.think.textGenerator.TextGenerator;
@@ -59,8 +59,8 @@ public final class Think implements AutoCloseable {
         // INTENTS: prod default => autoBootstrap=false
         this.intentDetector = (b.intentDetector != null)
                 ? b.intentDetector
-                : new IntentDetector(
-                IntentDetector.Config.builder()
+                : new BaseIntentDetector(
+                BaseIntentDetector.Config.builder()
                         .autoBootstrap(config.devMode) // devMode=true => bootstrap on; prod => off
                         .build()
         );
@@ -68,7 +68,7 @@ public final class Think implements AutoCloseable {
         this.responseStrategy = (b.responseStrategy != null) ? b.responseStrategy : new ContextAnswerStrategy();
         this.generator = b.generator;
 
-        this.evaluator = (b.evaluator != null) ? b.evaluator : new CandidateEvaluator(tokenizer);
+        this.evaluator = (b.evaluator != null) ? b.evaluator : new BaseCandidateEvaluator(tokenizer);
 
         this.seedProvider = (b.seedProvider != null) ? b.seedProvider : defaultSeedProvider(b.clock);
 

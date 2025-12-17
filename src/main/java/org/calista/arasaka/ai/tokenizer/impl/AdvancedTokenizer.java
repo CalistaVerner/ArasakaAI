@@ -51,8 +51,8 @@ public final class AdvancedTokenizer implements Tokenizer {
         String s = Normalizer.normalize(text, Normalizer.Form.NFKC)
                 .toLowerCase(Locale.ROOT);
 
+        // If stripping diacritics: NFD so marks become separate code points
         if (stripDiacritics) {
-            // NFD + remove combining marks
             s = Normalizer.normalize(s, Normalizer.Form.NFD);
         }
 
@@ -65,7 +65,7 @@ public final class AdvancedTokenizer implements Tokenizer {
         while (i < n) {
             char c = s.charAt(i);
 
-            // Optionally remove combining marks after NFD
+            // Skip combining marks after NFD
             if (stripDiacritics && isCombiningMark(c)) {
                 i++;
                 continue;
@@ -74,13 +74,13 @@ public final class AdvancedTokenizer implements Tokenizer {
             // URL/email fast-path: consume as a whole token
             if (keepUrls && looksLikeUrlStart(s, i)) {
                 int j = consumeUntilWhitespaceOrControl(s, i);
-                addToken(out, s.substring(i, j));
+                addTokenSubstring(out, s, i, j);
                 i = j;
                 continue;
             }
             if (keepEmails && looksLikeEmailStart(s, i)) {
                 int j = consumeEmailLike(s, i);
-                addToken(out, s.substring(i, j));
+                addTokenSubstring(out, s, i, j);
                 i = j;
                 continue;
             }
@@ -89,8 +89,8 @@ public final class AdvancedTokenizer implements Tokenizer {
             if ((c == '#' && keepHashtags) || (c == '@' && keepMentions)) {
                 int j = i + 1;
                 if (j < n && isTokenChar(s.charAt(j))) {
-                    j = consumeSimpleToken(s, j);
-                    addToken(out, s.substring(i, j));
+                    j = consumeTagToken(s, j);
+                    addTokenSubstring(out, s, i, j);
                     i = j;
                     continue;
                 }
@@ -129,7 +129,6 @@ public final class AdvancedTokenizer implements Tokenizer {
                         }
                     }
 
-                    // stop token
                     break;
                 }
 
@@ -137,7 +136,6 @@ public final class AdvancedTokenizer implements Tokenizer {
                 continue;
             }
 
-            // otherwise separator
             i++;
         }
 
@@ -160,10 +158,10 @@ public final class AdvancedTokenizer implements Tokenizer {
 
     private void addToken(List<String> out, CharSequence token) {
         if (token == null) return;
+
         int len = token.length();
         if (len < minLen) return;
 
-        // clamp very long tokens (protects memory + prevents junk like huge base64 blobs)
         if (len > maxLen) {
             out.add(token.subSequence(0, maxLen).toString());
         } else {
@@ -171,38 +169,59 @@ public final class AdvancedTokenizer implements Tokenizer {
         }
     }
 
-    private boolean isTokenChar(char c) {
+    /** Adds substring [i, j) but (optionally) removes combining marks if stripDiacritics is enabled. */
+    private void addTokenSubstring(List<String> out, String s, int i, int j) {
+        if (i >= j) return;
+
+        // Fast path when not stripping diacritics.
+        if (!stripDiacritics) {
+            addToken(out, s.substring(i, j));
+            return;
+        }
+
+        // Strip combining marks inside the substring (fixes URL/email/tag tokens).
+        StringBuilder b = new StringBuilder(Math.min(32, j - i));
+        for (int k = i; k < j; k++) {
+            char c = s.charAt(k);
+            if (!isCombiningMark(c)) b.append(c);
+        }
+        addToken(out, b);
+    }
+
+    private static boolean isTokenChar(char c) {
         return Character.isLetterOrDigit(c);
     }
 
-    private boolean isInnerConnector(char c) {
+    private static boolean isInnerConnector(char c) {
         return c == '-' || c == '_' || c == '\'' || c == '’';
     }
 
-    private boolean isCombiningMark(char c) {
+    private static boolean isCombiningMark(char c) {
         int t = Character.getType(c);
         return t == Character.NON_SPACING_MARK
                 || t == Character.COMBINING_SPACING_MARK
                 || t == Character.ENCLOSING_MARK;
     }
 
-    private boolean looksLikeUrlStart(String s, int i) {
-        // http://, https://, www.
+    private static boolean looksLikeUrlStart(String s, int i) {
         int n = s.length();
-        if (i + 4 <= n && s.regionMatches(i, "http", 0, 4)) return true;
-        if (i + 4 <= n && s.regionMatches(i, "www.", 0, 4)) return true;
-        return false;
+
+        // https://
+        if (i + 8 <= n && s.regionMatches(i, "https://", 0, 8)) return true;
+        // http://
+        if (i + 7 <= n && s.regionMatches(i, "http://", 0, 7)) return true;
+        // www.
+        return i + 4 <= n && s.regionMatches(i, "www.", 0, 4);
     }
 
-    private boolean looksLikeEmailStart(String s, int i) {
-        // Heuristic: if we see something like name@domain later in the same "chunk"
-        // We only trigger if current char is letter/digit to avoid garbage.
+    private static boolean looksLikeEmailStart(String s, int i) {
         if (i >= s.length()) return false;
         if (!isTokenChar(s.charAt(i))) return false;
 
         int n = s.length();
         int j = i;
         int atPos = -1;
+
         while (j < n) {
             char c = s.charAt(j);
             if (Character.isWhitespace(c) || Character.isISOControl(c)) break;
@@ -212,7 +231,7 @@ public final class AdvancedTokenizer implements Tokenizer {
         return atPos > i && atPos + 1 < n;
     }
 
-    private int consumeUntilWhitespaceOrControl(String s, int i) {
+    private static int consumeUntilWhitespaceOrControl(String s, int i) {
         int n = s.length();
         int j = i;
         while (j < n) {
@@ -223,8 +242,7 @@ public final class AdvancedTokenizer implements Tokenizer {
         return j;
     }
 
-    private int consumeEmailLike(String s, int i) {
-        // read until whitespace/control, then trim trailing punctuation
+    private static int consumeEmailLike(String s, int i) {
         int end = consumeUntilWhitespaceOrControl(s, i);
         while (end > i) {
             char last = s.charAt(end - 1);
@@ -237,10 +255,18 @@ public final class AdvancedTokenizer implements Tokenizer {
         return end;
     }
 
-    private int consumeSimpleToken(String s, int i) {
+    /** Hashtag/mention token rules: letters/digits + '_' + '.' allowed after first char. */
+    private static int consumeTagToken(String s, int i) {
         int n = s.length();
         int j = i;
-        while (j < n && isTokenChar(s.charAt(j))) j++;
+        while (j < n) {
+            char c = s.charAt(j);
+            if (isTokenChar(c) || c == '_' || c == '.') {
+                j++;
+            } else {
+                break;
+            }
+        }
         return j;
     }
 }

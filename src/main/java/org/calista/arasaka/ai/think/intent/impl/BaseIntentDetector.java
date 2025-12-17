@@ -39,9 +39,9 @@ import java.util.regex.Pattern;
  *   GREETING\tпривет\t1.0
  *   QUESTION\tпочему\t0.65
  */
-public final class IntentDetector implements org.calista.arasaka.ai.think.intent.IntentDetector {
+public final class BaseIntentDetector implements org.calista.arasaka.ai.think.intent.IntentDetector {
 
-    private static final Logger log = LogManager.getLogger(IntentDetector.class);
+    private static final Logger log = LogManager.getLogger(BaseIntentDetector.class);
 
     private static final Charset FILE_CHARSET = StandardCharsets.UTF_8;
 
@@ -53,7 +53,7 @@ public final class IntentDetector implements org.calista.arasaka.ai.think.intent
     // immutable snapshot: weights + meta
     private final AtomicReference<Snapshot> snap = new AtomicReference<>();
 
-    public IntentDetector(Config config) {
+    public BaseIntentDetector(Config config) {
         this.cfg = (config == null ? Config.builder().build() : config).freezeAndValidate();
 
         Snapshot loaded = null;

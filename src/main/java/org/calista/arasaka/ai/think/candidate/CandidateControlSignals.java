@@ -16,7 +16,7 @@ public final class CandidateControlSignals {
      *  - never include user text or context text
      *  - safe to store in Candidate.critique and feed into generator hint
      *  - engine query filters MUST block patterns like "g=0.42;" to prevent retriever poisoning
-     */
+
     public static String compact(CandidateEvaluator.Evaluation ev) {
         if (ev == null) return "";
 
@@ -46,7 +46,7 @@ public final class CandidateControlSignals {
         String s = b.toString();
         if (s.length() > 120) s = s.substring(0, 120);
         return s.replace(" ", "");
-    }
+    } */
 
     private static double clamp01(double v) {
         if (!Double.isFinite(v)) return 0.0;

@@ -2,6 +2,8 @@ package org.calista.arasaka.ai.think.candidate.impl;
 
 import org.calista.arasaka.ai.knowledge.Statement;
 import org.calista.arasaka.ai.retrieve.scorer.impl.TokenOverlapScorer;
+import org.calista.arasaka.ai.think.ThoughtState;
+import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
 
 import java.util.*;
@@ -25,20 +27,20 @@ import java.util.regex.Pattern;
  *
  * IMPORTANT: No-context mode:
  *  - When context is empty, do NOT punish groundedness/novelty harshly.
- *  - Instead punish echoing the question and repetition. This fixes the "Кто ты?" -> "Кто ты?" loop.
+ *  - Instead punish echoing the question and repetition.
  */
-public final class CandidateEvaluator implements org.calista.arasaka.ai.think.candidate.CandidateEvaluator {
+public final class BaseCandidateEvaluator implements CandidateEvaluator {
 
     // --- policy thresholds (tunable) ---
     private final double minGroundedness;
     private final double maxContradictionRisk;
 
-    private final double minQueryCoverage;      // candidate should overlap with user query
-    private final double maxNovelty;            // too many tokens not in context => likely hallucination
-    private final double maxRepetition;         // excessive repetition => low quality / loop
-    private final int minChars;                 // too short => usually useless (context mode)
-    private final int maxCharsSoft;             // soft penalty after this
-    private final int maxCharsHard;             // invalid after this (prevents runaway verbosity)
+    private final double minQueryCoverage;
+    private final double maxNovelty;
+    private final double maxRepetition;
+    private final int minChars;
+    private final int maxCharsSoft;
+    private final int maxCharsHard;
 
     private final Tokenizer tokenizer;
     private final TokenOverlapScorer overlapScorer;
@@ -54,7 +56,7 @@ public final class CandidateEvaluator implements org.calista.arasaka.ai.think.ca
 
     private static final Pattern BULLETISH = Pattern.compile("(?m)^\\s*([-*•]|\\d+\\.|\\d+\\))\\s+");
 
-    public CandidateEvaluator(Tokenizer tokenizer) {
+    public BaseCandidateEvaluator(Tokenizer tokenizer) {
         this(
                 tokenizer,
                 new TokenOverlapScorer(Objects.requireNonNull(tokenizer, "tokenizer")),
@@ -68,7 +70,7 @@ public final class CandidateEvaluator implements org.calista.arasaka.ai.think.ca
         );
     }
 
-    public CandidateEvaluator(
+    public BaseCandidateEvaluator(
             Tokenizer tokenizer,
             TokenOverlapScorer overlapScorer,
             double minGroundedness,
@@ -95,16 +97,11 @@ public final class CandidateEvaluator implements org.calista.arasaka.ai.think.ca
     }
 
     @Override
-    public double score(String userText, String candidateText, List<Statement> context) {
-        return evaluate(userText, candidateText, context).effectiveScore();
-    }
-
-    @Override
-    public Evaluation evaluate(String userText, String candidateText, List<Statement> context) {
+    public Evaluation evaluate(String userText, List<Statement> context, ThoughtState state, String draft) {
         final long t0 = System.nanoTime();
 
         final String q = userText == null ? "" : userText.trim();
-        final String a = candidateText == null ? "" : candidateText.trim();
+        final String a = draft == null ? "" : draft.trim();
         final List<Statement> ctx = context == null ? List.of() : context;
 
         final int tokens = safeTokenCount(a);
@@ -118,7 +115,7 @@ public final class CandidateEvaluator implements org.calista.arasaka.ai.think.ca
 
         // ---- 1) Structure quality ----
         Structure s = structureOf(a);
-        double structureScore = structureScoreOf(s); // (0..1)
+        double structureScore = structureScoreOf(s); // 0..1
 
         // ---- No-context mode ----
         if (ctx.isEmpty()) {
@@ -167,21 +164,22 @@ public final class CandidateEvaluator implements org.calista.arasaka.ai.think.ca
                     + ";st=" + fmt2(structureScore)
                     + ";v=" + (valid ? 1 : 0);
 
-            long nanos = System.nanoTime() - t0;
-            return new Evaluation(
-                    score,
-                    telemetry,
-                    queryCoverage,
-                    0.0,
-                    stylePenalty,
-                    0.0,
-                    contradictionRisk,
-                    structureScore,
-                    valid,
-                    telemetry,
-                    tokens,
-                    nanos
-            );
+            Evaluation ev = new Evaluation();
+            ev.score = score;
+            ev.valid = valid;
+
+            ev.groundedness = 0.0;
+            ev.contradictionRisk = contradictionRisk;
+            ev.structureScore = structureScore;
+
+            ev.repetition = rep.repetition;
+            ev.novelty = 0.0;
+            ev.coherence = queryCoverage; // cheap proxy in noctx mode
+
+            ev.critique = telemetry;
+            ev.validationNotes = telemetry;
+            ev.syncNotes();
+            return ev;
         }
 
         // ---- Context mode ----
@@ -249,7 +247,6 @@ public final class CandidateEvaluator implements org.calista.arasaka.ai.think.ca
                         - (0.35 * n.novelty)
                         - (0.35 * rep.repetition);
 
-        // Penalize missing schema stronger in context-mode
         if (!s.hasAllSections) score -= 0.35;
 
         String telemetry = "qc=" + fmt2(queryCoverage)
@@ -262,22 +259,26 @@ public final class CandidateEvaluator implements org.calista.arasaka.ai.think.ca
                 + ";risk=" + fmt2(contradictionRisk)
                 + ";v=" + (valid ? 1 : 0);
 
-        long nanos = System.nanoTime() - t0;
+        Evaluation ev = new Evaluation();
+        ev.score = score;
+        ev.valid = valid;
 
-        return new Evaluation(
-                score,
-                telemetry,
-                queryCoverage,
-                groundedness,
-                stylePenalty,
-                n.novelty,
-                contradictionRisk,
-                structureScore,
-                valid,
-                telemetry,
-                tokens,
-                nanos
-        );
+        ev.groundedness = groundedness;
+        ev.contradictionRisk = contradictionRisk;
+        ev.structureScore = structureScore;
+
+        ev.repetition = rep.repetition;
+        ev.novelty = n.novelty;
+
+        // coherence proxy: groundedness + queryCoverage weighted
+        ev.coherence = clamp01(0.60 * groundedness + 0.40 * queryCoverage);
+
+        // critique should be short & generator-safe; telemetry kept in validationNotes
+        ev.critique = telemetry;
+        ev.validationNotes = telemetry;
+
+        ev.syncNotes();
+        return ev;
     }
 
     // -------------------- structure --------------------
@@ -299,14 +300,11 @@ public final class CandidateEvaluator implements org.calista.arasaka.ai.think.ca
         boolean has2 = LEGACY_2.matcher(answer).find();
         boolean has3 = LEGACY_3.matcher(answer).find();
 
-        boolean legacyAll;
-
         int legacyCount = 0;
         Matcher m = SECTION_MARKERS.matcher(answer);
         while (m.find()) legacyCount++;
 
-        // New: accept any 3+ numbered sections (not only 1/2/3). Keeps legacy flags for telemetry.
-        legacyAll = legacyCount >= 3;
+        boolean legacyAll = legacyCount >= 3;
 
         int mdHeaders = 0;
         Matcher mh = MD_HEADER.matcher(answer);
@@ -528,20 +526,22 @@ public final class CandidateEvaluator implements org.calista.arasaka.ai.think.ca
     // -------------------- invalid helper --------------------
 
     private Evaluation invalid(double score, String note, int tokens, long nanos) {
-        return new Evaluation(
-                score,
-                note,
-                0.0,
-                0.0,
-                1.0,
-                1.0,
-                1.0,
-                0.0,
-                false,
-                note,
-                tokens,
-                nanos
-        );
+        Evaluation ev = new Evaluation();
+        ev.score = score;
+        ev.valid = false;
+        ev.groundedness = 0.0;
+        ev.contradictionRisk = 1.0;
+        ev.structureScore = 0.0;
+
+        ev.novelty = 1.0;
+        ev.repetition = 1.0;
+        ev.coherence = 0.0;
+
+        ev.critique = note == null ? "" : note;
+        ev.validationNotes = ev.critique;
+
+        ev.syncNotes();
+        return ev;
     }
 
     // -------------------- misc math --------------------

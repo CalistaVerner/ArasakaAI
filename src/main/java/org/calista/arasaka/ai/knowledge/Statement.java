@@ -1,4 +1,3 @@
-// Statement.java
 package org.calista.arasaka.ai.knowledge;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
@@ -7,18 +6,23 @@ import java.time.Instant;
 import java.util.*;
 
 /**
- * Statement — единица long-term memory.
+ * Statement — единица long-term memory / retrieval evidence.
  *
- * <p>
- * Поля public — удобно для Jackson и минимального бойлерплейта.
- * Без "магии": только метаданные, нужные для ранжирования/валидирования/TTL.
- * </p>
+ * Enterprise goals:
+ * - public fields for Jackson (minimal boilerplate)
+ * - deterministic validation/normalization
+ * - explicit ranking signals: weight, confidence, priority
+ * - copy-on-write helpers for safe compression/rerank
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public final class Statement {
 
+    // --------- Identity ---------
+
     /** Stable unique ID. */
     public String id;
+
+    // --------- Content ---------
 
     /** Human-readable content (fact/rule/episode/etc). */
     public String text;
@@ -29,17 +33,35 @@ public final class Statement {
      */
     public String type = "fact";
 
+    // --------- Ranking signals ---------
+
     /** Weight/importance (>= 0). */
     public double weight = 1.0;
 
     /** Confidence 0..1 (model/user/system). */
     public double confidence = 1.0;
 
+    /**
+     * Priority 0..1 (enterprise routing/ranking signal).
+     *
+     * Meaning:
+     * - 0.0  = lowest priority evidence
+     * - 1.0  = highest priority evidence
+     *
+     * Use-cases:
+     * - prefer "profile/preference" over generic facts
+     * - prefer recent verified evidence over weak sources
+     * - policy overrides without touching weight/confidence
+     */
+    public double priority = 0.5;
+
     /** Optional tags for grouping and query expansion. */
     public List<String> tags = List.of();
 
     /** Where it came from: dialogue/file/system/etc. */
     public String source;
+
+    // --------- Time & lifecycle ---------
 
     /** Timestamps for recency scoring. */
     public long createdAtEpochMs = 0L;
@@ -51,6 +73,10 @@ public final class Statement {
     /** Free-form metadata (enterprise extensibility). */
     public Map<String, Object> meta = new HashMap<>();
 
+    // ---------------------------------------------------------------------
+    // Validation / normalization
+    // ---------------------------------------------------------------------
+
     public void validate() {
         if (id == null || id.isBlank()) throw new IllegalArgumentException("Statement.id is required");
         if (text == null || text.isBlank()) throw new IllegalArgumentException("Statement.text is required");
@@ -58,13 +84,18 @@ public final class Statement {
         if (type == null || type.isBlank()) type = "fact";
         type = type.trim().toLowerCase(Locale.ROOT);
 
-        if (!Double.isFinite(weight) || weight < 0) weight = 1.0;
-        if (!Double.isFinite(confidence)) confidence = 1.0;
-        confidence = Math.max(0.0, Math.min(1.0, confidence));
+        if (!Double.isFinite(weight) || weight < 0.0) weight = 1.0;
 
-        if (tags == null) tags = List.of();
-        // normalize tags (lowercase, non-empty, unique but stable order)
-        if (!tags.isEmpty()) {
+        if (!Double.isFinite(confidence)) confidence = 1.0;
+        confidence = clamp01(confidence);
+
+        if (!Double.isFinite(priority)) priority = 0.5;
+        priority = clamp01(priority);
+
+        if (tags == null || tags.isEmpty()) {
+            tags = List.of();
+        } else {
+            // normalize tags (lowercase, non-empty, unique but stable order)
             LinkedHashSet<String> norm = new LinkedHashSet<>();
             for (String t : tags) {
                 if (t == null) continue;
@@ -76,27 +107,82 @@ public final class Statement {
         }
 
         long now = System.currentTimeMillis();
-        if (createdAtEpochMs <= 0) createdAtEpochMs = now;
-        if (updatedAtEpochMs <= 0) updatedAtEpochMs = createdAtEpochMs;
+        if (createdAtEpochMs <= 0L) createdAtEpochMs = now;
+        if (updatedAtEpochMs <= 0L) updatedAtEpochMs = createdAtEpochMs;
         if (updatedAtEpochMs < createdAtEpochMs) updatedAtEpochMs = createdAtEpochMs;
+
+        if (meta == null) meta = new HashMap<>();
     }
+
+    // ---------------------------------------------------------------------
+    // Copy helpers (for safe compression/rerank)
+    // ---------------------------------------------------------------------
+
+    /** Copy-on-write: returns a shallow copy with replaced text. */
+    public Statement withText(String newText) {
+        Statement s = new Statement();
+        s.id = this.id;
+        s.text = newText;
+        s.type = this.type;
+        s.weight = this.weight;
+        s.confidence = this.confidence;
+        s.priority = this.priority;
+        s.tags = this.tags;
+        s.source = this.source;
+        s.createdAtEpochMs = this.createdAtEpochMs;
+        s.updatedAtEpochMs = this.updatedAtEpochMs;
+        s.expiresAtEpochMs = this.expiresAtEpochMs;
+        s.meta = this.meta;
+        return s;
+    }
+
+    // ---------------------------------------------------------------------
+    // Lifecycle helpers
+    // ---------------------------------------------------------------------
 
     /** Enterprise-friendly: "touch" timestamps on upsert (unless caller manages them). */
     public void touchUpdatedNow() {
         long now = System.currentTimeMillis();
-        if (createdAtEpochMs <= 0) createdAtEpochMs = now;
+        if (createdAtEpochMs <= 0L) createdAtEpochMs = now;
         updatedAtEpochMs = now;
     }
 
     public boolean isExpiredNow() {
-        return expiresAtEpochMs > 0 && System.currentTimeMillis() > expiresAtEpochMs;
+        return expiresAtEpochMs > 0L && System.currentTimeMillis() > expiresAtEpochMs;
     }
 
     public Instant createdAt() {
-        return Instant.ofEpochMilli(createdAtEpochMs <= 0 ? System.currentTimeMillis() : createdAtEpochMs);
+        return Instant.ofEpochMilli(createdAtEpochMs <= 0L ? System.currentTimeMillis() : createdAtEpochMs);
     }
 
     public Instant updatedAt() {
-        return Instant.ofEpochMilli(updatedAtEpochMs <= 0 ? System.currentTimeMillis() : updatedAtEpochMs);
+        return Instant.ofEpochMilli(updatedAtEpochMs <= 0L ? System.currentTimeMillis() : updatedAtEpochMs);
+    }
+
+    // ---------------------------------------------------------------------
+    // Derived helpers (transparent, no magic)
+    // ---------------------------------------------------------------------
+
+    /** Base evidence strength signal. */
+    public double effectiveWeight() {
+        return weight * confidence;
+    }
+
+    private static double clamp01(double x) {
+        if (x < 0.0) return 0.0;
+        if (x > 1.0) return 1.0;
+        return x;
+    }
+
+    @Override
+    public String toString() {
+        return "Statement{"
+                + "id='" + id + '\''
+                + ", type='" + type + '\''
+                + ", w=" + weight
+                + ", conf=" + confidence
+                + ", pr=" + priority
+                + ", expired=" + isExpiredNow()
+                + '}';
     }
 }
