@@ -12,9 +12,8 @@ import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.think.candidate.impl.MultiCriteriaCandidateEvaluator;
 import org.calista.arasaka.ai.think.engine.ThoughtCycleEngine;
 import org.calista.arasaka.ai.think.engine.impl.IterativeThoughtEngine;
-import org.calista.arasaka.ai.think.engine.impl.BeamSearchRagEngine;
 import org.calista.arasaka.ai.think.intent.IntentDetector;
-import org.calista.arasaka.ai.think.intent.impl.HashedIntentDetector;
+import org.calista.arasaka.ai.think.intent.impl.AdvancedIntentDetector;
 import org.calista.arasaka.ai.think.textGenerator.TextGenerator;
 import org.calista.arasaka.ai.think.textGenerator.impl.BigramBeamTextGenerator;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
@@ -49,22 +48,38 @@ public final class AIComposer {
         // ---------- common deps (Java only) ----------
         Scorer scorer = new TokenOverlapScorer(tokenizer);
 
-        ExplorationConfig expl = new ExplorationConfig(
-                cfg.thinking.exploration.temperature,
-                cfg.thinking.exploration.topK,
-                cfg.thinking.exploration.iterations,
-                cfg.thinking.exploration.candidateMultiplier,
-                cfg.thinking.exploration.diversity,
-                cfg.thinking.exploration.minScore,
-                cfg.thinking.exploration.iterationDecay,
-                cfg.thinking.exploration.refineTerms,
-                cfg.thinking.exploration.candidateGateMinTokenLen,
-                cfg.thinking.exploration.maxCandidatesPerIter,
-                cfg.thinking.exploration.qualityFloor,
-                cfg.thinking.exploration.earlyStopConfidence,
-                cfg.thinking.exploration.parallel,
-                cfg.thinking.exploration.parallelism
-        );
+        ExplorationConfig expl = ExplorationConfig.builder()
+                .temperature(cfg.thinking.exploration.temperature)
+                .topK(cfg.thinking.exploration.topK)
+                .iterations(cfg.thinking.exploration.iterations)
+                .candidateMultiplier(cfg.thinking.exploration.candidateMultiplier)
+                .diversity(cfg.thinking.exploration.diversity)
+                .minScore(cfg.thinking.exploration.minScore)
+                .iterationDecay(cfg.thinking.exploration.iterationDecay)
+
+                .refineTerms(cfg.thinking.exploration.refineTerms)
+                .candidateGateMinTokenLen(cfg.thinking.exploration.candidateGateMinTokenLen)
+                .maxCandidatesPerIter(cfg.thinking.exploration.maxCandidatesPerIter)
+
+                .qualityFloor(cfg.thinking.exploration.qualityFloor)
+                .coverageK(cfg.thinking.exploration.coverageK)
+                .contradictionPenalty(cfg.thinking.exploration.contradictionPenalty)
+                .earlyStopConfidence(cfg.thinking.exploration.earlyStopConfidence)
+
+                .parallel(cfg.thinking.exploration.parallel)
+                .parallelism(cfg.thinking.exploration.parallelism)
+
+                // ---- production RAG ----
+                .rerankN(cfg.thinking.exploration.rerankN)
+                .rerankM(cfg.thinking.exploration.rerankM)
+                .compressSentencesPerStatement(cfg.thinking.exploration.compressSentencesPerStatement)
+                .compressMaxCharsPerStatement(cfg.thinking.exploration.compressMaxCharsPerStatement)
+
+                // ---- anti-water ----
+                .refineDfCut(cfg.thinking.exploration.refineDfCut)
+
+                .build();
+
 
         Retriever retriever = new KnowledgeRetriever(
                 kernel.knowledge(),
@@ -74,13 +89,14 @@ public final class AIComposer {
                 12
         );
 
-        IntentDetector intentDetector = new HashedIntentDetector();
+        IntentDetector intentDetector = new AdvancedIntentDetector();
         CandidateEvaluator evaluator = new MultiCriteriaCandidateEvaluator(tokenizer);
         ResponseStrategy strategy = new ContextAnswerStrategy();
         TextGenerator generator = new BigramBeamTextGenerator(tokenizer);
 
         // ---------- JS plan ----------
         Map plan = BUILD_PLAN.execute(Value.asValue(cfg)).as(Map.class);
+        /*
         String engine = ((String) plan.get("engine")).toLowerCase();
         System.out.println(engine + " Engine");
         if (engine.contains("beam")) {
@@ -106,7 +122,7 @@ public final class AIComposer {
                     i(plan, "ltmRecallK"),
                     d(plan, "ltmWriteMinGroundedness")
             );
-        } else {
+        } else { */
             log.info("Building Iterative Engine");
             return new IterativeThoughtEngine(
                     retriever,
@@ -126,7 +142,7 @@ public final class AIComposer {
                     i(plan, "refineRounds"),
                     i(plan, "refineQueryBudget")
             );
-        }
+
     }
 
     // small helpers

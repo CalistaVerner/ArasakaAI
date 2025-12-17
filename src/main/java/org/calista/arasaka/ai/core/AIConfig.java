@@ -45,6 +45,8 @@ public final class AIConfig {
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static final class Exploration {
+
+        // -------- base retrieval --------
         public double temperature = 0.8;
         public int topK = 40;
         public int iterations = 3;
@@ -52,14 +54,51 @@ public final class AIConfig {
         public double diversity = 0.18;
         public double minScore = 1e-9;
         public double iterationDecay = 0.72;
+
+        // -------- query refinement / gating --------
         public int refineTerms = 14;
         public int candidateGateMinTokenLen = 3;
         public int maxCandidatesPerIter = 120_000;
+
+        // -------- quality / validation --------
+        /** Minimum acceptable combined quality (confidence ⊗ coverage − penalty). */
         public double qualityFloor = 0.0;
+
+        /** How many top documents are checked for query token coverage (0 disables). */
+        public int coverageK = 32;
+
+        /** Penalty weight for contradictory evidence (0 disables). */
+        public double contradictionPenalty = 0.35;
+
+        /** Early stop retrieval iterations if confidence reaches this value (0 disables). */
         public double earlyStopConfidence = 0.0;
+
+        // -------- performance --------
         public boolean parallel = false;
         public int parallelism = 0;
+
+        // -------- production RAG: retrieve → rerank → compress --------
+        /** Rerank only top-N candidates (precision stage). */
+        public int rerankN = 80;
+
+        /** After rerank, keep only top-M (recommended 12–20). */
+        public int rerankM = 16;
+
+        /** How many best sentences to keep per Statement during compression. */
+        public int compressSentencesPerStatement = 2;
+
+        /** Hard cap for compressed text per Statement (characters). */
+        public int compressMaxCharsPerStatement = 700;
+
+        // -------- anti-noise / anti-water --------
+        /**
+         * Drop candidate tokens in query refinement if they appear
+         * in >= this fraction of top documents.
+         * Typical range: 0.55–0.70
+         */
+        public double refineDfCut = 0.60;
     }
+
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static final class Learning {

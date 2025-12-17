@@ -9,15 +9,17 @@ import org.calista.arasaka.ai.tokenizer.Tokenizer;
 
 import java.util.*;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
- * NeuralTextGenerator (fixed)
+ * BigramBeamTextGenerator (thinking-cycle + retrieval + quality)
  *
- * Fixes:
- * - RU/EN connector mixing eliminated (Cyrillic userText => RU)
- * - Identity queries bypass bigram chaining (compose from context or minimal deterministic self-description)
- * - Start tokens avoid query echo for identity
- * - STOP + stronger anti-echo guard remains
+ * Key upgrades (no new files/classes outside this file):
+ * - Multi-iteration thinking cycle: retrieval -> draft -> validate -> improve -> pick best
+ * - Deterministic draft diversity via draftIndex+iter rotation (no randomness)
+ * - Context retrieval: build graph from most relevant Statements first (less noise, more focus)
+ * - Quality scoring: balances context-coverage, uniqueness, query-coverage, anti-echo, connector ratio
+ * - All tunable via state.tags without hardcoding scenario logic
  */
 public final class BigramBeamTextGenerator implements TextGenerator {
 
@@ -58,8 +60,13 @@ public final class BigramBeamTextGenerator implements TextGenerator {
     private final double queryRepeatPenalty;
     private final double connectorPenalty;
 
+    // --- anti-echo knobs ---
+    private final double maxEchoRatio;        // if answer shares too much with query -> penalize/avoid EOS
+    private final double queryTokenPenalty;   // always penalize query tokens a bit (prevents echo loops)
+
     public BigramBeamTextGenerator(Tokenizer tokenizer) {
-        this(tokenizer, 12, 6, 24, 6, 2, 0.65, 1.15, 0.10);
+        this(tokenizer, 12, 10, 32, 8, 2, 0.65, 1.15, 0.10,
+                0.55, 0.12);
     }
 
     public BigramBeamTextGenerator(
@@ -71,7 +78,9 @@ public final class BigramBeamTextGenerator implements TextGenerator {
             int maxSameTokenRun,
             double repeatPenalty,
             double queryRepeatPenalty,
-            double connectorPenalty
+            double connectorPenalty,
+            double maxEchoRatio,
+            double queryTokenPenalty
     ) {
         this.tokenizer = Objects.requireNonNull(tokenizer, "tokenizer");
         this.beamWidth = clampInt(beamWidth, 1, 64);
@@ -84,6 +93,9 @@ public final class BigramBeamTextGenerator implements TextGenerator {
         this.repeatPenalty = clamp01(repeatPenalty);
         this.queryRepeatPenalty = clamp01(queryRepeatPenalty);
         this.connectorPenalty = clamp01(connectorPenalty);
+
+        this.maxEchoRatio = clamp01(maxEchoRatio);
+        this.queryTokenPenalty = clamp01(queryTokenPenalty);
     }
 
     @Override
@@ -99,98 +111,213 @@ public final class BigramBeamTextGenerator implements TextGenerator {
 
         final Set<String> qTok = asTokenSet(tokenizer.tokenize(userText));
 
+        // Allow deterministic runtime overrides via tags (engine/config can tune without changing code)
+        int minTok = this.minTokens;
+        int maxTok = this.maxTokens;
+        if (state != null && state.tags != null) {
+            minTok = clampInt(safeInt(state.tags.get("gen.minTok"), minTok), 4, 96);
+            maxTok = clampInt(safeInt(state.tags.get("gen.maxTok"), maxTok), minTok, 160);
+        }
+
+        // If query is very short/identity-like, require more substance to avoid 3-4 token echo.
+        if (qTok.size() <= 5) {
+            minTok = Math.max(minTok, 18);
+            maxTok = Math.max(maxTok, 36);
+        }
+
         // --- NO CONTEXT: configurable fallback (no chains) ---
         if (ctx.isEmpty()) {
             String out = noContextReply(userText, lang, state);
             if (log.isDebugEnabled()) {
                 long nanos = System.nanoTime() - t0;
-                log.debug("NeuralTextGenerator | noctx=1 lang={} qTok={} dtMs={} out='{}'",
+                log.debug("BigramBeamTextGenerator | noctx=1 lang={} qTok={} dtMs={} out='{}'",
                         lang, qTok.size(), nanos / 1_000_000L, snippet(out, 180));
             }
             return out;
         }
 
-        // --- Context mode: bigram graph ---
-        Graph g = buildGraph(ctx, connectors);
-
-        List<String> starts = startTokens(g, qTok, connectors);
-
-        List<Beam> beam = new ArrayList<>(beamWidth);
-        for (String s : starts) beam.add(Beam.start(s));
-
-        int steps = 1;
-        while (steps < maxTokens) {
-            ArrayList<Beam> next = new ArrayList<>(beamWidth * 4);
-
-            for (Beam b : beam) {
-                if (b == null) continue;
-
-                if (shouldStop(b, steps)) {
-                    next.add(b.extend(STOP, 0.05));
-                    continue;
-                }
-
-                String last = b.last();
-                Map<String, Double> outs = g.next.get(last);
-
-                if (outs == null || outs.isEmpty()) {
-                    next.add(b.extend(STOP, 0.0));
-                    for (String c : connectors) {
-                        if (!isAllowed(c)) continue;
-                        next.add(b.extend(c, scoreStep(b, c, 0.15, qTok, connectors, true)));
-                    }
-                    continue;
-                }
-
-                outs.entrySet().stream()
-                        .sorted((a, x) -> {
-                            int cmp = Double.compare(x.getValue(), a.getValue());
-                            if (cmp != 0) return cmp;
-                            return a.getKey().compareTo(x.getKey());
-                        })
-                        .limit(Math.max(10, beamWidth * 2L))
-                        .forEach(e -> {
-                            String tok = e.getKey();
-                            if (!isAllowed(tok)) return;
-
-                            boolean isConn = connectors.contains(tok);
-                            double edgeW = e.getValue() == null ? 0.0 : e.getValue();
-
-                            next.add(b.extend(tok, scoreStep(b, tok, edgeW, qTok, connectors, isConn)));
-                        });
-
-                if (b.tokens.size() >= minTokens) next.add(b.extend(STOP, 0.0));
-            }
-
-            next.sort(Comparator.comparingDouble((Beam b) -> b.score).reversed()
-                    .thenComparing(Beam::textKey));
-
-            beam = dedupeAndTop(next, beamWidth);
-
-            if (!beam.isEmpty() && STOP.equals(beam.get(0).last())) break;
-
-            steps++;
+        // --- THINKING CYCLE: retrieval -> draft -> validate -> improve (deterministic) ---
+        int iters = 4;
+        int ctxLimit = 24;
+        if (state != null && state.tags != null) {
+            iters = clampInt(safeInt(state.tags.get("gen.iters"), iters), 1, 8);
+            ctxLimit = clampInt(safeInt(state.tags.get("gen.ctxLimit"), ctxLimit), 8, 160);
         }
 
-        Beam best = pickBest(beam);
+        ArrayList<Draft> drafts = new ArrayList<>(iters);
+
+        for (int iter = 0; iter < iters; iter++) {
+            int lim = Math.min(ctx.size(), ctxLimit + iter * 12);
+
+            // retrieval: pick most relevant statements first
+            List<Statement> picked = selectRelevantContext(ctx, qTok, lim);
+            if (picked.isEmpty()) picked = ctx;
+
+            // generate draft
+            Graph g = buildGraph(picked, connectors);
+
+            int baseRot = (state == null) ? 0 : Math.max(0, state.draftIndex);
+            int rot = baseRot + iter;
+
+            Beam b = runBeam(g, qTok, connectors, minTok, maxTok, rot);
+            if (b == null) continue;
+
+            Quality q = evaluateQuality(userText, qTok, b.tokens, connectors, picked, minTok);
+            drafts.add(new Draft(b, q, iter, picked.size()));
+
+            // early exit if excellent
+            if (q.total >= 0.90 && q.echoRatio <= (maxEchoRatio * 0.75)) break;
+        }
+
+        Draft bestDraft = drafts.stream()
+                .sorted((a, b) -> {
+                    int cmp = Double.compare(b.q.total, a.q.total);
+                    if (cmp != 0) return cmp;
+                    // tie-breakers: lower echo, higher context coverage, earlier iter
+                    cmp = Double.compare(a.q.echoRatio, b.q.echoRatio);
+                    if (cmp != 0) return cmp;
+                    cmp = Double.compare(b.q.contextCoverage, a.q.contextCoverage);
+                    if (cmp != 0) return cmp;
+                    return Integer.compare(a.iter, b.iter);
+                })
+                .findFirst()
+                .orElse(null);
+
+        Beam best = (bestDraft == null) ? null : bestDraft.beam;
         String out = (best == null) ? "" : detokenize(best.tokens, lang);
         out = postFix(userText, out, lang);
 
         if (log.isDebugEnabled()) {
             long nanos = System.nanoTime() - t0;
-            log.debug("NeuralTextGenerator | ctx={} lang={} qTok={} beamW={} outTok={} uniq={} dtMs={} out='{}'",
-                    ctx.size(),
-                    lang,
-                    qTok.size(),
-                    beamWidth,
-                    best == null ? 0 : best.tokens.size(),
-                    best == null ? 0 : best.uniqueCount(),
-                    nanos / 1_000_000L,
-                    snippet(out, 220));
+            if (bestDraft != null) {
+                log.debug("BigramBeamTextGenerator | think=1 iters={} bestIter={} bestQ={} echo={} qCov={} ctxCov={} connR={} uniqR={} picked={} qTok={} outTok={} dtMs={} out='{}'",
+                        drafts.size(),
+                        bestDraft.iter,
+                        round3(bestDraft.q.total),
+                        round3(bestDraft.q.echoRatio),
+                        round3(bestDraft.q.queryCoverage),
+                        round3(bestDraft.q.contextCoverage),
+                        round3(bestDraft.q.connectorRatio),
+                        round3(bestDraft.q.uniqueRatio),
+                        bestDraft.pickedCount,
+                        qTok.size(),
+                        best == null ? 0 : best.tokens.size(),
+                        nanos / 1_000_000L,
+                        snippet(out, 240));
+            } else {
+                log.debug("BigramBeamTextGenerator | think=1 iters={} bestIter=-1 qTok={} dtMs={} out='{}'",
+                        drafts.size(), qTok.size(), nanos / 1_000_000L, snippet(out, 240));
+            }
         }
 
         if (out.isBlank()) return noContextReply(userText, lang, state);
         return out;
+    }
+
+    // -------------------- thinking: draft & quality --------------------
+
+    private record Draft(Beam beam, Quality q, int iter, int pickedCount) {}
+
+    private record Quality(
+            double total,
+            double echoRatio,
+            double queryCoverage,
+            double contextCoverage,
+            double connectorRatio,
+            double uniqueRatio,
+            int len
+    ) {}
+
+    private List<Statement> selectRelevantContext(List<Statement> ctx, Set<String> qTok, int limit) {
+        if (ctx == null || ctx.isEmpty()) return List.of();
+        if (qTok == null) qTok = Set.of();
+        final Set<String> q = qTok;
+
+        return ctx.stream()
+                .filter(Objects::nonNull)
+                .filter(s -> s.text != null && !s.text.isBlank())
+                .map(s -> new AbstractMap.SimpleEntry<>(s, relevanceScore(s, q)))
+                .sorted((a, b) -> Double.compare(b.getValue(), a.getValue()))
+                .limit(Math.max(4, limit))
+                .map(Map.Entry::getKey)
+                .toList();
+    }
+
+    private double relevanceScore(Statement st, Set<String> qTok) {
+        List<String> toks = normalizeTokens(tokenizer.tokenize(st.text));
+        if (toks.isEmpty()) return 0.0;
+
+        int hit = 0;
+        for (String t : toks) if (qTok.contains(t)) hit++;
+
+        double cov = (qTok.isEmpty()) ? 0.0 : (double) hit / Math.max(1, qTok.size());
+        double dens = (double) hit / Math.max(4, toks.size());
+
+        double w = 0.0;
+        try { w = st.weight; } catch (Exception ignored) {}
+
+        double lenPenalty = Math.min(1.0, toks.size() / 40.0) * 0.15;
+
+        return (cov * 1.20) + (dens * 0.80) + (Math.tanh(w) * 0.40) - lenPenalty;
+    }
+
+    private Quality evaluateQuality(
+            String userText,
+            Set<String> qTok,
+            List<String> outTokens,
+            List<String> connectors,
+            List<Statement> usedCtx,
+            int minTok
+    ) {
+        int len = 0;
+        int echoHit = 0;
+        int qHit = 0;
+        int conn = 0;
+
+        Set<String> uniq = new HashSet<>();
+        for (String t : outTokens) {
+            if (t == null || t.isBlank() || STOP.equals(t)) continue;
+            len++;
+            uniq.add(t);
+            if (qTok != null && qTok.contains(t)) {
+                echoHit++;
+                qHit++;
+            }
+            if (connectors != null && connectors.contains(t)) conn++;
+        }
+
+        double echo = (len <= 0) ? 0.0 : (double) echoHit / (double) len;
+        double qCov = (qTok == null || qTok.isEmpty()) ? 0.0 : (double) qHit / (double) Math.max(1, qTok.size());
+        double connRatio = (len <= 0) ? 0.0 : (double) conn / (double) len;
+        double uniqRatio = (len <= 0) ? 0.0 : (double) uniq.size() / (double) len;
+
+        Set<String> ctxTok = new HashSet<>();
+        if (usedCtx != null) {
+            for (Statement s : usedCtx) {
+                if (s == null || s.text == null) continue;
+                ctxTok.addAll(normalizeTokens(tokenizer.tokenize(s.text)));
+                if (ctxTok.size() > 4096) break;
+            }
+        }
+
+        int ctxHit = 0;
+        for (String t : uniq) if (ctxTok.contains(t)) ctxHit++;
+        double ctxCov = (uniq.isEmpty()) ? 0.0 : (double) ctxHit / (double) uniq.size();
+
+        double total = 0.0;
+        total += (len >= minTok) ? 0.35 : -0.35;
+        total += ctxCov * 0.65;
+        total += uniqRatio * 0.25;
+        total += Math.min(0.25, qCov * 0.20);
+        total -= echo * 0.70;
+        total -= Math.max(0.0, connRatio - 0.22) * 0.60;
+
+        return new Quality(total, echo, qCov, ctxCov, connRatio, uniqRatio, len);
+    }
+
+    private static double round3(double v) {
+        if (!Double.isFinite(v)) return 0.0;
+        return Math.round(v * 1000.0) / 1000.0;
     }
 
     // -------------------- no-context reply --------------------
@@ -264,32 +391,129 @@ public final class BigramBeamTextGenerator implements TextGenerator {
         return new Graph(next, freq);
     }
 
-    private List<String> startTokens(Graph g, Set<String> qTok, List<String> connectors) {
+    private List<String> startTokens(Graph g, Set<String> qTok, List<String> connectors, ThoughtState state) {
+        int rot = (state == null) ? 0 : Math.max(0, state.draftIndex);
+        return startTokens(g, qTok, connectors, rot);
+    }
+
+    private List<String> startTokens(Graph g, Set<String> qTok, List<String> connectors, int rot) {
         if (g.freq.isEmpty()) return connectors.stream().limit(3).toList();
 
-        // Start from query-overlap terms when possible, but avoid pure query-echo by filtering BAN/etc.
-        List<String> overlap = g.freq.keySet().stream()
-                .filter(qTok::contains)
-                .filter(this::isAllowed)
-                .sorted()
-                .limit(8)
-                .toList();
-        if (!overlap.isEmpty()) return overlap;
+        // If query is short, query-overlap start tokens cause mode collapse (echo).
+        boolean allowOverlapStarts = qTok.size() >= 6;
+        if (allowOverlapStarts) {
+            List<String> overlap = g.freq.keySet().stream()
+                    .filter(qTok::contains)
+                    .filter(this::isAllowed)
+                    .sorted()
+                    .collect(Collectors.toList());
+            if (!overlap.isEmpty()) return rotate(overlap, rot).stream().limit(8).toList();
+        }
 
-        // frequent non-connector
+        // Prefer frequent non-connector tokens that are NOT in the query (anti-echo).
         List<String> top = g.freq.entrySet().stream()
                 .map(Map.Entry::getKey)
                 .filter(this::isAllowed)
                 .filter(t -> !connectors.contains(t))
+                .filter(t -> !qTok.contains(t))
                 .sorted()
-                .limit(8)
-                .toList();
-        if (!top.isEmpty()) return top;
+                .collect(Collectors.toList());
+        if (!top.isEmpty()) return rotate(top, rot).stream().limit(8).toList();
+
+        // fallback: frequent non-connector even if in query
+        List<String> top2 = g.freq.entrySet().stream()
+                .map(Map.Entry::getKey)
+                .filter(this::isAllowed)
+                .filter(t -> !connectors.contains(t))
+                .sorted()
+                .collect(Collectors.toList());
+        if (!top2.isEmpty()) return rotate(top2, rot).stream().limit(8).toList();
 
         return connectors.stream().limit(3).toList();
     }
 
-    // -------------------- beam --------------------
+    private static <T> List<T> rotate(List<T> in, int rot) {
+        if (in == null || in.isEmpty()) return List.of();
+        int n = in.size();
+        int r = (n == 0) ? 0 : (Math.floorMod(rot, n));
+        if (r == 0) return in;
+        ArrayList<T> out = new ArrayList<>(n);
+        out.addAll(in.subList(r, n));
+        out.addAll(in.subList(0, r));
+        return out;
+    }
+
+    // -------------------- beam core --------------------
+
+    private Beam runBeam(Graph g, Set<String> qTok, List<String> connectors, int minTok, int maxTok, int rot) {
+        List<String> starts = startTokens(g, qTok, connectors, rot);
+
+        List<Beam> beam = new ArrayList<>(beamWidth);
+        for (String s : starts) beam.add(Beam.start(s));
+
+        int steps = 1;
+        while (steps < maxTok) {
+            ArrayList<Beam> next = new ArrayList<>(beamWidth * 4);
+
+            for (Beam b : beam) {
+                if (b == null) continue;
+
+                if (shouldStop(b, steps, minTok)) {
+                    // discourage ending if we're still echoing the query too much
+                    double er = echoRatio(b, qTok);
+                    double eos = (er > maxEchoRatio) ? -0.25 : 0.05;
+                    next.add(b.extend(STOP, eos));
+                    continue;
+                }
+
+                String last = b.last();
+                Map<String, Double> outs = g.next.get(last);
+
+                if (outs == null || outs.isEmpty()) {
+                    next.add(b.extend(STOP, 0.0));
+                    for (String c : connectors) {
+                        if (!isAllowed(c)) continue;
+                        next.add(b.extend(c, scoreStep(b, c, 0.15, qTok, connectors, true, minTok)));
+                    }
+                    continue;
+                }
+
+                outs.entrySet().stream()
+                        .sorted((a, x) -> {
+                            int cmp = Double.compare(x.getValue(), a.getValue());
+                            if (cmp != 0) return cmp;
+                            return a.getKey().compareTo(x.getKey());
+                        })
+                        .limit(Math.max(10, beamWidth * 2L))
+                        .forEach(e -> {
+                            String tok = e.getKey();
+                            if (!isAllowed(tok)) return;
+
+                            boolean isConn = connectors.contains(tok);
+                            double edgeW = e.getValue() == null ? 0.0 : e.getValue();
+
+                            next.add(b.extend(tok, scoreStep(b, tok, edgeW, qTok, connectors, isConn, minTok)));
+                        });
+
+                if (b.tokens.size() >= minTok) {
+                    double er = echoRatio(b, qTok);
+                    double eos = (er > maxEchoRatio) ? -0.20 : 0.0;
+                    next.add(b.extend(STOP, eos));
+                }
+            }
+
+            next.sort(Comparator.comparingDouble((Beam b) -> b.score).reversed()
+                    .thenComparing(Beam::textKey));
+
+            beam = dedupeAndTop(next, beamWidth);
+
+            if (!beam.isEmpty() && STOP.equals(beam.get(0).last())) break;
+
+            steps++;
+        }
+
+        return pickBest(beam, minTok);
+    }
 
     private static final class Beam {
         final ArrayList<String> tokens;
@@ -352,29 +576,49 @@ public final class BigramBeamTextGenerator implements TextGenerator {
         }
     }
 
-    private boolean shouldStop(Beam b, int steps) {
-        if (b.tokens.size() < minTokens) return false;
+    private boolean shouldStop(Beam b, int steps, int minTok) {
+        if (b.tokens.size() < minTok) return false;
         if (b.uniqueCount() < Math.min(minUniqueTokens, Math.max(2, b.tokens.size() / 3))) return false;
         if (b.runOfLast() >= maxSameTokenRun) return true;
-        return steps >= minTokens + 2;
+        return steps >= minTok + 2;
     }
 
-    private double scoreStep(Beam b, String tok, double edgeWeight, Set<String> qTok, List<String> connectors, boolean isConnector) {
+    private double echoRatio(Beam b, Set<String> qTok) {
+        if (b == null || qTok == null || qTok.isEmpty()) return 0.0;
+        int tot = 0;
+        int hit = 0;
+        for (String t : b.tokens) {
+            if (t == null || t.isBlank() || STOP.equals(t)) continue;
+            tot++;
+            if (qTok.contains(t)) hit++;
+        }
+        if (tot <= 0) return 0.0;
+        return (double) hit / (double) tot;
+    }
+
+    private double scoreStep(Beam b, String tok, double edgeWeight, Set<String> qTok, List<String> connectors, boolean isConnector, int minTok) {
         if (STOP.equals(tok)) {
-            double ok = (b.tokens.size() >= minTokens) ? 0.12 : -0.10;
+            double er = echoRatio(b, qTok);
+            double ok = (b.tokens.size() >= minTok) ? 0.12 : -0.10;
             ok += (b.uniqueCount() >= 3) ? 0.05 : -0.05;
+            if (er > maxEchoRatio) ok -= 0.22; // discourage ending while still echoing
             return ok;
         }
 
         double ev = Math.log1p(Math.max(0.0, edgeWeight)) * 0.35;
 
-        double qHit = qTok.contains(tok) ? 0.10 : 0.0;
+        // IMPORTANT: do not *reward* query tokens. Rewarding causes echo loops.
+        double qHit = 0.0;
 
         int tokCount = b.freq.getOrDefault(tok, 0);
         double rep = (tokCount <= 0) ? 0.0 : (repeatPenalty * Math.min(1.0, tokCount / 2.0));
 
+        // Always penalize query tokens a bit (prevents "Кто ты" -> "Кто ты").
+        double qTokPen = (qTok != null && qTok.contains(tok)) ? queryTokenPenalty : 0.0;
+
+        // Extra penalty if query token repeats inside the answer.
         double qRep = 0.0;
-        if (qTok.contains(tok) && tokCount >= 1) {
+        if (qTok != null && qTok.contains(tok) && tokCount >= 1) {
             qRep = queryRepeatPenalty * Math.min(1.0, tokCount / 2.0);
         }
 
@@ -392,7 +636,7 @@ public final class BigramBeamTextGenerator implements TextGenerator {
         double uniq = 0.0;
         if (b.uniqueCount() < 3) uniq += 0.08;
 
-        return ev + qHit + uniq - rep - qRep - conn - stutter;
+        return ev + qHit + uniq - rep - qTokPen - qRep - conn - stutter;
     }
 
     private static List<Beam> dedupeAndTop(List<Beam> beams, int k) {
@@ -407,14 +651,14 @@ public final class BigramBeamTextGenerator implements TextGenerator {
         return (out.size() > k) ? out.subList(0, k) : out;
     }
 
-    private Beam pickBest(List<Beam> beam) {
+    private Beam pickBest(List<Beam> beam, int minTok) {
         if (beam == null || beam.isEmpty()) return null;
         Beam best = null;
         for (Beam b : beam) {
             if (b == null) continue;
             boolean ended = STOP.equals(b.last());
             int len = ended ? b.tokens.size() - 1 : b.tokens.size();
-            if (len < minTokens) continue;
+            if (len < minTok) continue;
             if (b.uniqueCount() < 3) continue;
 
             if (best == null) best = b;
@@ -457,6 +701,7 @@ public final class BigramBeamTextGenerator implements TextGenerator {
         boolean c = HAS_CYR.matcher(x).matches();
         boolean l = HAS_LAT.matcher(x).matches();
         if (c && !l) return Lang.RU;
+        if (c && l) return Lang.RU; // mixed: prefer RU to avoid EN leaks in RU dialog
         if (!c && l) return Lang.EN;
 
         // default
@@ -565,5 +810,14 @@ public final class BigramBeamTextGenerator implements TextGenerator {
         if (v < lo) return lo;
         if (v > hi) return hi;
         return v;
+    }
+
+    private static int safeInt(String s, int def) {
+        if (s == null) return def;
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Exception ignored) {
+            return def;
+        }
     }
 }

@@ -38,38 +38,42 @@ public final class TokenOverlapScorer implements Scorer {
     @Override
     public void prepare(Collection<Statement> corpus) {
         if (prepared) return;
-        if (corpus == null || corpus.isEmpty()) {
-            prepared = true;
-            return;
+        synchronized (this) {
+            if (prepared) return;
+
+            if (corpus == null || corpus.isEmpty()) {
+                prepared = true;
+                return;
+            }
+
+            HashMap<String, Integer> df = new HashMap<>(64_000);
+            int docs = 0;
+            long totalLen = 0;
+
+            for (Statement st : corpus) {
+                if (st == null || st.text == null || st.text.isBlank()) continue;
+                docs++;
+
+                String[] toks = tokenizeToArray(st.text);
+                tokCache.put(keyOf(st), toks);
+                totalLen += toks.length;
+
+                HashSet<String> uniq = new HashSet<>(toks.length * 2);
+                for (String t : toks) if (t != null && t.length() >= 3) uniq.add(t);
+                for (String t : uniq) df.merge(t, 1, Integer::sum);
+            }
+
+            final double N = Math.max(1.0, (double) docs);
+            HashMap<String, Double> idfLocal = new HashMap<>(df.size() * 2);
+            for (var e : df.entrySet()) {
+                double v = Math.log((N + 1.0) / (e.getValue() + 1.0)) + 1.0;
+                idfLocal.put(e.getKey(), v);
+            }
+
+            this.idf = Collections.unmodifiableMap(idfLocal);
+            this.avgDocLen = Math.max(1.0, (double) totalLen / Math.max(1.0, (double) docs));
+            this.prepared = true;
         }
-
-        HashMap<String, Integer> df = new HashMap<>(64_000);
-        int docs = 0;
-        long totalLen = 0;
-
-        for (Statement st : corpus) {
-            if (st == null || st.text == null || st.text.isBlank()) continue;
-            docs++;
-
-            String[] toks = tokenizeToArray(st.text);
-            tokCache.put(keyOf(st), toks);
-            totalLen += toks.length;
-
-            HashSet<String> uniq = new HashSet<>(toks.length * 2);
-            for (String t : toks) if (t != null && t.length() >= 3) uniq.add(t);
-            for (String t : uniq) df.merge(t, 1, Integer::sum);
-        }
-
-        final double N = Math.max(1.0, (double) docs);
-        HashMap<String, Double> idfLocal = new HashMap<>(df.size() * 2);
-        for (var e : df.entrySet()) {
-            double v = Math.log((N + 1.0) / (e.getValue() + 1.0)) + 1.0;
-            idfLocal.put(e.getKey(), v);
-        }
-
-        this.idf = Collections.unmodifiableMap(idfLocal);
-        this.avgDocLen = Math.max(1.0, (double) totalLen / Math.max(1.0, (double) docs));
-        this.prepared = true;
     }
 
     @Override

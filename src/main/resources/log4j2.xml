@@ -2,24 +2,74 @@
 <Configuration status="OFF">
     <Properties>
         <Property name="logDir">logs</Property>
+
+        <!-- IMPORTANT: keep as ONE LINE to avoid extra blank lines in output -->
+        <Property name="consolePattern">%style{[%d{HH:mm:ss}]}{bold,black} %highlight{[%p]}{FATAL=bg_red, ERROR=red, WARN=yellow, INFO=green, DEBUG=blue, TRACE=cyan} %style{%X{workerName}{[Name-%X{workerName}]}}{magenta} %style{%X{reqId}{[req-%X{reqId}]}}{bold,white} %style{%X{intent}{[Intent-%X{intent}]}}{cyan} %style{%X{iter}{[Iter-%X{iter}]}}{blue} %style{%m}{black}%n%throwable</Property>
+
+        <Property name="filePattern">[%d{HH:mm:ss.SSS}][%p] %X{workerName}{[Name-%X{workerName}]} %X{reqId}{[req-%X{reqId}]} %X{seed}{[seed-%X{seed}]} %X{intent}{[Intent-%X{intent}]} %X{iter}{[Iter-%X{iter}]} %m%n%throwable</Property>
     </Properties>
 
     <Appenders>
         <Console name="Console" target="SYSTEM_OUT">
-            <PatternLayout
-                    pattern="%style{[%d{HH:mm:ss}]}{bold,black} %highlight{[%p]}{FATAL=bg_red, ERROR=red, WARN=yellow, INFO=green, DEBUG=blue, TRACE=cyan} %style{%X{workerName}{[Name-%X{workerName}]}}{magenta} %style{%m}{black}%n%throwable"
-                    disableAnsi="false" />
+            <PatternLayout pattern="${consolePattern}" disableAnsi="false"/>
         </Console>
 
-        <File name="File" fileName="logs/lastlog.log" append="false">
-            <PatternLayout pattern="[%d{HH:mm:ss.SSS}][%p] %X{workerName}{[Name-%X{workerName}]} %m%n%throwable" />
+        <!-- keep your lastlog.log behavior -->
+        <File name="File" fileName="${logDir}/lastlog.log" append="false">
+            <PatternLayout pattern="${filePattern}"/>
         </File>
+
+        <!-- rolling archive -->
+        <RollingFile name="RollingFile"
+                     fileName="${logDir}/app.log"
+                     filePattern="${logDir}/app-%d{yyyy-MM-dd}-%i.log.gz">
+            <PatternLayout pattern="${filePattern}"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy interval="1" modulate="true"/>
+                <SizeBasedTriggeringPolicy size="25 MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="30"/>
+        </RollingFile>
+
+        <!-- optional separate think trace -->
+        <RollingFile name="ThinkTraceFile"
+                     fileName="${logDir}/think.log"
+                     filePattern="${logDir}/think-%d{yyyy-MM-dd}-%i.log.gz">
+            <PatternLayout pattern="${filePattern}"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy interval="1" modulate="true"/>
+                <SizeBasedTriggeringPolicy size="25 MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="14"/>
+        </RollingFile>
+
+        <!-- async wrappers -->
+        <Async name="AsyncConsole">
+            <AppenderRef ref="Console"/>
+        </Async>
+        <Async name="AsyncFile">
+            <AppenderRef ref="File"/>
+        </Async>
+        <Async name="AsyncRolling">
+            <AppenderRef ref="RollingFile"/>
+        </Async>
+        <Async name="AsyncThink">
+            <AppenderRef ref="ThinkTraceFile"/>
+        </Async>
     </Appenders>
 
     <Loggers>
+        <!-- optional: think module logs also go to think.log -->
+        <Logger name="org.calista.arasaka.ai.think" level="TRACE" additivity="false">
+            <AppenderRef ref="AsyncConsole"/>
+            <AppenderRef ref="AsyncRolling"/>
+            <AppenderRef ref="AsyncThink"/>
+        </Logger>
+
         <Root level="TRACE">
-            <AppenderRef ref="Console" />
-            <AppenderRef ref="File" />
+            <AppenderRef ref="AsyncConsole"/>
+            <AppenderRef ref="AsyncFile"/>
+            <AppenderRef ref="AsyncRolling"/>
         </Root>
     </Loggers>
 </Configuration>

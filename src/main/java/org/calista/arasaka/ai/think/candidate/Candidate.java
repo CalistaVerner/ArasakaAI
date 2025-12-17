@@ -1,9 +1,5 @@
 package org.calista.arasaka.ai.think.candidate;
 
-import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
-
-import java.util.Objects;
-
 public final class Candidate {
     public final String text;
     public final double score;
@@ -30,7 +26,7 @@ public final class Candidate {
     }
 
     public static Candidate fromEvaluation(String text, CandidateEvaluator.Evaluation ev) {
-        String shortCrit = QuantumNotes.compact(ev);         // <<< ВАЖНО
+        String shortCrit = CandidateControlSignals.compact(ev);         // <<< ВАЖНО
         String diag = (ev == null) ? "" : ev.validationNotes; // telemetry остаётся здесь
         double s = (ev == null) ? Double.NEGATIVE_INFINITY : ev.effectiveScore();
         return new Candidate(text, s, shortCrit, ev, diag);

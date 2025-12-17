@@ -22,6 +22,7 @@ import java.util.*;
  * - candidate evaluation metrics
  * Not a subword tokenizer for LLM (BPE/WordPiece should be separate).
  */
+@Deprecated
 public final class HybridTokenizer implements Tokenizer {
 
     public static final int DEFAULT_MIN_TOKEN_LEN = 1;

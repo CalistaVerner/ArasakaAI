@@ -9,6 +9,7 @@ import org.calista.arasaka.ai.learn.Learner;
 import org.calista.arasaka.ai.learn.impl.AdvancedLearner;
 import org.calista.arasaka.ai.think.engine.ThoughtCycleEngine;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
+import org.calista.arasaka.ai.tokenizer.impl.AdvancedTokenizer;
 import org.calista.arasaka.ai.tokenizer.impl.HybridTokenizer;
 
 import java.io.IOException;
@@ -30,7 +31,7 @@ public final class AIApp {
     AIApp() throws IOException {
         Path cfg = Path.of("config/config.json");
         kernel = AIKernel.boot(cfg);
-        tokenizer = new HybridTokenizer();
+        tokenizer = new AdvancedTokenizer();
         AIComposer = new AIComposer(this);
         thoughtCycleEngine = AIComposer.buildEngine(kernel, tokenizer);
         learner = new AdvancedLearner(kernel.knowledge(), tokenizer, kernel.config().learning.newStatementWeight, kernel.config().learning.reinforceStep);

@@ -10,6 +10,9 @@ public final class Scored<T> implements Comparable<Scored<T>> {
     public final T item;
     public final double score;
 
+    // Memoized stable key (reflection can be expensive in tight loops).
+    private transient volatile String stableKey;
+
     public Scored(T item, double score) {
         this.item = item;
         this.score = score;
@@ -23,6 +26,9 @@ public final class Scored<T> implements Comparable<Scored<T>> {
      * Stable key used for deterministic tie-breaks. Avoid identity-based hash codes.
      */
     public String stableKey() {
+        String cached = stableKey;
+        if (cached != null) return cached;
+
         if (item == null) return "null";
 
         // Fast path for common pattern: public fields id/text.
@@ -46,12 +52,19 @@ public final class Scored<T> implements Comparable<Scored<T>> {
             } catch (NoSuchFieldException ignored) {
             }
 
-            if (id != null) return "id:" + id;
-            if (text != null) return "tx:" + text;
+            if (id != null) {
+                stableKey = "id:" + id;
+                return stableKey;
+            }
+            if (text != null) {
+                stableKey = "tx:" + text;
+                return stableKey;
+            }
         } catch (Throwable ignored) {
         }
 
-        return String.valueOf(item);
+        stableKey = String.valueOf(item);
+        return stableKey;
     }
 
     @Override

@@ -4,6 +4,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.calista.arasaka.ai.think.intent.Intent;
 import org.calista.arasaka.ai.think.intent.IntentDetector;
+import org.calista.arasaka.ai.think.NeuronGraph;
 
 import java.text.Normalizer;
 import java.util.*;
@@ -51,11 +52,22 @@ public final class AdvancedIntentDetector implements IntentDetector {
     /** Debug */
     private final boolean debugLog;
 
+    /** Optional adaptive graph (learned delta weights). Default = null (fully static). */
+    private final NeuronGraph neuronGraph;
+
     public AdvancedIntentDetector() {
-        this(Config.builder().build());
+        this(Config.builder().build(), null);
     }
 
     public AdvancedIntentDetector(Config cfg) {
+        this(cfg, null);
+    }
+
+    /**
+     * Optional constructor: inject NeuronGraph to add learned (dynamic) weights.
+     * API compatibility preserved: default constructors still work.
+     */
+    public AdvancedIntentDetector(Config cfg, NeuronGraph neuronGraph) {
         Objects.requireNonNull(cfg, "cfg");
         this.weights = new EnumMap<>(Intent.class);
         for (Intent it : Intent.values()) {
@@ -77,6 +89,8 @@ public final class AdvancedIntentDetector implements IntentDetector {
         this.uniqueTokens = cfg.uniqueTokens;
 
         this.debugLog = cfg.debugLog;
+
+        this.neuronGraph = neuronGraph;
     }
 
     @Override
@@ -126,6 +140,12 @@ public final class AdvancedIntentDetector implements IntentDetector {
                 score += add;
 
                 if (debugLog) hits.get(it).add(new FeatureHit(f, wf, mul, add));
+            }
+
+            // Learned delta (feature -> intent) from NeuronGraph.
+            // Small bounded value to avoid overpowering static weights.
+            if (neuronGraph != null && !features.isEmpty()) {
+                score += neuronGraph.scoreIntent(it.name(), features, stats.counts);
             }
 
             // Length normalization: prevents long prompts from dominating via many small hits

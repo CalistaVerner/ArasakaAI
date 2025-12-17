@@ -4,6 +4,7 @@ import org.calista.arasaka.ai.knowledge.Statement;
 import org.calista.arasaka.ai.think.intent.Intent;
 
 import java.util.*;
+import java.util.regex.MatchResult;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -79,7 +80,7 @@ public final class ContextAnswerStrategy implements ResponseStrategy {
         if (s == null || s.isBlank()) return Set.of();
         return WORD.matcher(s.toLowerCase(Locale.ROOT))
                 .results()
-                .map(r -> r.group())
+                .map(MatchResult::group)
                 .limit(256)
                 .collect(Collectors.toSet());
     }
