@@ -14,8 +14,8 @@ import java.util.Map;
  * ThoughtState — mutable per-request state used by the think-loop.
  *
  * Enterprise rules:
- * - No hardcoded user-visible text here.
- * - Tags + generationHint are the primary control plane for the generator/evaluator.
+ * - Must be deterministic for the same inputs (seed + userText + context).
+ * - It is OK to store runtime caches, but they must be transient and never affect determinism.
  * - copyForDraft() MUST clone tags to avoid cross-draft interference.
  * - Context is stored explicitly (no implicit retrieval inside strategies).
  */
@@ -27,71 +27,85 @@ public final class ThoughtState {
     public int iteration;
     public int draftIndex;
 
-    /** Engine phase ordinal (EXPLORE/EXPLOIT/REPAIR/VERIFY...). */
+    /** Engine phase enum ordinal (see CandidateControlSignals.Phase). */
     public int phase;
 
-    /** Diversity ordinal (LOW/MED/HIGH...). */
+    /** Diversity enum ordinal (see CandidateControlSignals.Diversity). */
     public int diversity;
-
-    // -------------------- Intent --------------------
 
     public Intent intent;
 
     // -------------------- Generation control --------------------
 
-    /** Soft hint for generator (structured, parseable; may include previous metrics). */
+    /**
+     * Optional hint from previous best answer or repair pass.
+     * Generator should treat it as "anchor" but must remain deterministic.
+     */
     public String generationHint;
 
     /** Canonical tag-map used to control generation/strategy/evaluator (deterministic). */
     public Map<String, String> tags;
 
+    /**
+     * Runtime per-request/per-iteration cache.
+     *
+     * Not part of the determinism contract; must be treated as ephemeral.
+     * Intended for sharing precomputed artifacts (e.g., context token unions) across drafts.
+     */
+    public transient Map<String, Object> cache;
+
     // -------------------- Context snapshot (explicit) --------------------
 
     /**
      * Context snapshot used by the engine for the CURRENT best answer.
-     * This is the only context that final ResponseStrategy should use.
+     * This is the only context that final response strategy must rely on.
      */
     public List<Statement> lastContext;
 
-    /** Deterministic query list used for retrieval on the last iteration (debug/telemetry). */
+    /** Queries used for the most recent retrieval step. */
     public List<String> lastQueries;
 
-    // -------------------- LTM recall signals --------------------
+    // -------------------- Memory / recall snapshot --------------------
 
-    /** Evidence recalled from LTM (optional; subset). */
+    /** Evidence recalled from LTM (if enabled). */
     public List<Statement> recalledMemory;
 
-    /** Optional: raw recall query terms (debug/telemetry; deterministic). */
+    /** Queries used for LTM recall in the most recent iteration. */
     public List<String> recallQueries;
 
-    // -------------------- Best-so-far tracking --------------------
+    // -------------------- Candidate snapshots (optional, for strategies) --------------------
 
+    /** Best candidate so far (across iterations). */
     public Candidate bestSoFar;
+
+    /** Evaluation of best candidate so far (cached convenience). */
     public CandidateEvaluator.Evaluation bestEvaluation;
 
-    // -------------------- Last snapshot --------------------
-
+    /** Last evaluated candidate in current iteration (for debugging/strategies). */
     public Candidate lastCandidate;
+
+    /** Last evaluation (for debugging/strategies). */
     public CandidateEvaluator.Evaluation lastEvaluation;
+
+    /** Last critique string (generator-safe). */
     public String lastCritique;
 
-    // -------------------- Engine telemetry/bookkeeping --------------------
+    // -------------------- Engine telemetry (never feed to generator) --------------------
 
+    /** Engine notes / flags (telemetry only). */
     public String engineNotes;
+
+    /** Best score delta on last iteration (telemetry). */
     public double scoreDelta;
+
+    /** Stagnation counter (telemetry). */
     public int stagnation;
 
-    /** Deterministic per-iteration trace lines (compact, safe-to-log). */
+    /** Append-only trace lines (telemetry). */
     public List<String> trace;
 
-    public ThoughtState() {}
+    // -------------------- Lifecycle helpers --------------------
 
-    /**
-     * Copy state for a specific draft.
-     * - tags are cloned (copy-on-draft)
-     * - context/memory snapshots are shared references (treated as read-only lists)
-     * - candidates/evaluations are shared references (treated as immutable snapshots by convention)
-     */
     public ThoughtState copyForDraft(int newDraftIndex) {
         ThoughtState s = new ThoughtState();
 
@@ -108,6 +122,9 @@ public final class ThoughtState {
         if (this.tags != null && !this.tags.isEmpty()) {
             s.tags = new HashMap<>(this.tags);
         }
+
+        // runtime cache (shared across drafts within the same iteration)
+        s.cache = this.cache;
 
         // explicit context snapshots
         s.lastContext = this.lastContext;
@@ -147,19 +164,28 @@ public final class ThoughtState {
     }
 
     public void putTagIfAbsent(String key, String value) {
-        ensureTags().putIfAbsent(key, value);
+        Map<String, String> t = ensureTags();
+        t.putIfAbsent(key, value);
     }
 
-    public void removeTag(String key) {
-        if (tags != null) tags.remove(key);
+    public String tag(String key) {
+        if (tags == null) return null;
+        return tags.get(key);
+    }
+
+    public boolean tagTrue(String key) {
+        String v = tag(key);
+        if (v == null) return false;
+        v = v.trim();
+        return "1".equals(v) || "true".equalsIgnoreCase(v) || "yes".equalsIgnoreCase(v);
     }
 
     public List<String> ensureTrace() {
-        if (trace == null) trace = new ArrayList<>(16);
+        if (trace == null) trace = new ArrayList<>(64);
         return trace;
     }
 
-    public void addTrace(String line) {
+    public void trace(String line) {
         if (line == null || line.isBlank()) return;
         ensureTrace().add(line);
     }

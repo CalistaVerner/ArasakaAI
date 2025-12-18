@@ -6,7 +6,7 @@ import org.calista.arasaka.ai.core.AIKernel;
 import org.calista.arasaka.ai.core.AIComposer;
 import org.calista.arasaka.ai.events.AIEvent;
 import org.calista.arasaka.ai.learn.Learner;
-import org.calista.arasaka.ai.learn.impl.AdvancedLearner;
+import org.calista.arasaka.ai.learn.impl.BasicLearner;
 import org.calista.arasaka.ai.think.Think;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
 import org.calista.arasaka.ai.tokenizer.impl.AdvancedTokenizer;
@@ -64,7 +64,7 @@ public final class AIApp {
             // 3) Compose Think orchestrator (Think owns its eval pool unless injected)
             think = composer.buildEngine(kernel, tokenizer);
 
-            learner = new AdvancedLearner(
+            learner = new BasicLearner(
                     kernel.knowledge(),
                     tokenizer,
                     kernel.config().learning.newStatementWeight,

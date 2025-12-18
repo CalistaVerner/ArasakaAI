@@ -118,11 +118,17 @@ public final class Statement {
     // Copy helpers (for safe compression/rerank)
     // ---------------------------------------------------------------------
 
-    /** Copy-on-write: returns a shallow copy with replaced text. */
-    public Statement withText(String newText) {
+    /**
+     * Shallow structural copy.
+     *
+     * <p>Notes:
+     * - tags/meta references are shared (shallow) for performance
+     * - use {@link #withMeta(String, Object)} / {@link #withTags(List)} if you need copy-on-write
+     */
+    public Statement copyShallow() {
         Statement s = new Statement();
         s.id = this.id;
-        s.text = newText;
+        s.text = this.text;
         s.type = this.type;
         s.weight = this.weight;
         s.confidence = this.confidence;
@@ -133,6 +139,62 @@ public final class Statement {
         s.updatedAtEpochMs = this.updatedAtEpochMs;
         s.expiresAtEpochMs = this.expiresAtEpochMs;
         s.meta = this.meta;
+        return s;
+    }
+
+    /** Copy-on-write: returns a shallow copy with replaced text. */
+    public Statement withText(String newText) {
+        Statement s = copyShallow();
+        s.text = newText;
+        return s;
+    }
+
+    /** Copy-on-write: returns a shallow copy with replaced type. */
+    public Statement withType(String newType) {
+        Statement s = copyShallow();
+        s.type = (newType == null || newType.isBlank()) ? "fact" : newType.trim().toLowerCase(Locale.ROOT);
+        return s;
+    }
+
+    /** Copy-on-write: returns a shallow copy with replaced tags (no normalization here; caller can call validate()). */
+    public Statement withTags(List<String> newTags) {
+        Statement s = copyShallow();
+        s.tags = (newTags == null || newTags.isEmpty()) ? List.of() : new ArrayList<>(newTags);
+        return s;
+    }
+
+    /**
+     * Copy-on-write: returns a shallow copy with meta key set.
+     * Meta map is copied (one level) to avoid cross-thread mutation issues.
+     */
+    public Statement withMeta(String key, Object value) {
+        Statement s = copyShallow();
+        HashMap<String, Object> m = (this.meta == null) ? new HashMap<>() : new HashMap<>(this.meta);
+        if (key != null && !key.isBlank()) {
+            if (value == null) m.remove(key);
+            else m.put(key, value);
+        }
+        s.meta = m;
+        return s;
+    }
+
+    /**
+     * Copy-on-write: add a single tag (lowercased/trimmed), stable order, no duplicates.
+     * This is handy for annotating evidence during rerank/compress.
+     */
+    public Statement withTag(String tag) {
+        if (tag == null) return this;
+        String x = tag.trim().toLowerCase(Locale.ROOT);
+        if (x.isBlank()) return this;
+
+        List<String> cur = (this.tags == null) ? List.of() : this.tags;
+        if (cur.contains(x)) return this;
+
+        Statement s = copyShallow();
+        ArrayList<String> t = new ArrayList<>(cur.size() + 1);
+        t.addAll(cur);
+        t.add(x);
+        s.tags = t;
         return s;
     }
 

@@ -4,8 +4,11 @@ package org.calista.arasaka.ai.think;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.calista.arasaka.ai.retrieve.retriver.Retriever;
+import org.calista.arasaka.ai.retrieve.scorer.impl.TokenOverlapScorer;
+import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 import org.calista.arasaka.ai.think.candidate.impl.BaseCandidateEvaluator;
 import org.calista.arasaka.ai.think.engine.impl.IterativeThoughtEngine;
+import org.calista.arasaka.ai.think.intent.IntentDetector;
 import org.calista.arasaka.ai.think.intent.impl.BaseIntentDetector;
 import org.calista.arasaka.ai.think.response.ContextAnswerStrategy;
 import org.calista.arasaka.ai.think.response.ResponseStrategy;
@@ -22,11 +25,11 @@ import java.util.function.LongSupplier;
  * Think — единый enterprise-оркестратор.
  *
  * Ownership change:
- *  - Think владеет evalExecutor (создание/закрытие), engine только использует его.
+ *  - Think владеет evalExecutor (создание/закрытие).
  *
- * Enterprise change:
- *  - prod default: AdvancedIntentDetector autoBootstrap=false (no hardcode),
- *    bootstrap allowed only in dev profile.
+ * Note:
+ *  - Текущий IterativeThoughtEngine (новая версия) не принимает evalPool в конструкторе.
+ *    Пул оставлен как owned-resource для будущего параллельного scoring/verify или иных задач.
  */
 public final class Think implements AutoCloseable {
 
@@ -36,14 +39,16 @@ public final class Think implements AutoCloseable {
 
     private final Retriever retriever;
     private final Tokenizer tokenizer;
-    private final org.calista.arasaka.ai.think.intent.IntentDetector intentDetector;
+    private final IntentDetector intentDetector;
     private final ResponseStrategy responseStrategy;
-    private final org.calista.arasaka.ai.think.candidate.CandidateEvaluator evaluator;
+    private final CandidateEvaluator evaluator;
     private final TextGenerator generator; // nullable
+
+    private final TokenOverlapScorer overlapScorer;
 
     private final LongSupplier seedProvider;
 
-    // Owned resources
+    // Owned resources (kept for enterprise future use)
     private final ExecutorService evalPool;
     private final boolean ownsEvalPool;
 
@@ -66,22 +71,42 @@ public final class Think implements AutoCloseable {
         );
 
         this.responseStrategy = (b.responseStrategy != null) ? b.responseStrategy : new ContextAnswerStrategy();
-        this.generator = b.generator;
+        this.generator = b.generator; // nullable ok
 
-        this.evaluator = (b.evaluator != null) ? b.evaluator : new BaseCandidateEvaluator(tokenizer);
+        // Scorer (idf/tokens cache inside)
+        this.overlapScorer = (b.overlapScorer != null) ? b.overlapScorer : new TokenOverlapScorer(tokenizer);
+
+        // Evaluator (new ctor)
+        this.evaluator = (b.evaluator != null) ? b.evaluator : new BaseCandidateEvaluator(
+                tokenizer,
+                overlapScorer,
+                config.evalMinGroundedness,
+                config.evalMaxContradictionRisk,
+                config.evalMinQueryCoverage,
+                config.evalMaxNovelty,
+                config.evalMaxRepetition,
+                config.evalMinChars,
+                config.evalMaxCharsSoft,
+                config.evalMaxCharsHard
+        );
 
         this.seedProvider = (b.seedProvider != null) ? b.seedProvider : defaultSeedProvider(b.clock);
 
-        // IMPORTANT: ownership rule for JAR/DI usage
+        // Pool ownership (kept; engine currently doesn't consume it)
         this.ownsEvalPool = (b.evalPool == null);
         this.evalPool = ownsEvalPool ? createEvalPool(config) : b.evalPool;
 
+        // ---- Engine (NEW signature) ----
+        // IterativeThoughtEngine(retriever, intentDetector, generator, evaluator, strategy,
+        //   iterations, retrieveK, draftsPerIteration, patience, targetScore,
+        //   exploitEvidenceStrictness, strictVerifyEnabled, strictVerifyMinScore,
+        //   ltmEnabled, ltmCapacity, ltmRecallK, ltmWriteMinGroundedness, ltmDecayPerTick, ltmPromotionBoost)
         this.engine = new IterativeThoughtEngine(
                 retriever,
                 intentDetector,
-                responseStrategy,
-                evaluator,
                 generator,
+                evaluator,
+                responseStrategy,
                 evalPool,
                 config.evalParallelism,
                 config.iterations,
@@ -89,18 +114,13 @@ public final class Think implements AutoCloseable {
                 config.draftsPerIteration,
                 config.patience,
                 config.targetScore,
+                config.exploitEvidenceStrictness,
+                config.strictVerifyEnabled,
+                config.strictVerifyMinScore,
                 config.ltmEnabled,
                 config.ltmCapacity,
                 config.ltmRecallK,
                 config.ltmWriteMinGroundedness,
-                config.refineRounds,
-                config.refineQueryBudget,
-                // new knobs:
-                config.exploreIters,
-                config.exploreRetrieveKMult,
-                config.exploitEvidenceStrictness,
-                config.strictVerifyEnabled,
-                config.strictVerifyMinScore,
                 config.ltmDecayPerTick,
                 config.ltmPromotionBoost
         );
@@ -132,11 +152,13 @@ public final class Think implements AutoCloseable {
 
     public Tokenizer getTokenizer() { return tokenizer; }
 
-    public org.calista.arasaka.ai.think.intent.IntentDetector getIntentDetector() { return intentDetector; }
+    public IntentDetector getIntentDetector() { return intentDetector; }
 
     public ResponseStrategy getResponseStrategy() { return responseStrategy; }
 
-    public org.calista.arasaka.ai.think.candidate.CandidateEvaluator getEvaluator() { return evaluator; }
+    public CandidateEvaluator getEvaluator() { return evaluator; }
+
+    public TokenOverlapScorer getOverlapScorer() { return overlapScorer; }
 
     public TextGenerator getGenerator() { return generator; }
 
@@ -170,10 +192,12 @@ public final class Think implements AutoCloseable {
         private final Retriever retriever;
         private final Tokenizer tokenizer;
 
-        private org.calista.arasaka.ai.think.intent.IntentDetector intentDetector;
+        private IntentDetector intentDetector;
         private ResponseStrategy responseStrategy;
-        private org.calista.arasaka.ai.think.candidate.CandidateEvaluator evaluator;
+        private CandidateEvaluator evaluator;
         private TextGenerator generator;
+
+        private TokenOverlapScorer overlapScorer;
 
         private LongSupplier seedProvider;
         private Clock clock = Clock.systemUTC();
@@ -193,7 +217,7 @@ public final class Think implements AutoCloseable {
             return this;
         }
 
-        public Builder intentDetector(org.calista.arasaka.ai.think.intent.IntentDetector detector) {
+        public Builder intentDetector(IntentDetector detector) {
             this.intentDetector = Objects.requireNonNull(detector, "intentDetector");
             return this;
         }
@@ -203,13 +227,18 @@ public final class Think implements AutoCloseable {
             return this;
         }
 
-        public Builder evaluator(org.calista.arasaka.ai.think.candidate.CandidateEvaluator evaluator) {
+        public Builder evaluator(CandidateEvaluator evaluator) {
             this.evaluator = Objects.requireNonNull(evaluator, "evaluator");
             return this;
         }
 
         public Builder generator(TextGenerator generator) {
             this.generator = generator; // nullable ok
+            return this;
+        }
+
+        public Builder overlapScorer(TokenOverlapScorer scorer) {
+            this.overlapScorer = Objects.requireNonNull(scorer, "overlapScorer");
             return this;
         }
 
@@ -254,20 +283,11 @@ public final class Think implements AutoCloseable {
         public int patience = 2;
         public double targetScore = 0.65;
 
-        // refinement
-        public int refineRounds = 1;
-        public int refineQueryBudget = 16;
-
-        // 3.1 Explore/Exploit knobs
-        public int exploreIters = 2;
-        public double exploreRetrieveKMult = 1.5;
-        public double exploitEvidenceStrictness = 0.78;
-
-        // 3.2 strict verify-pass
+        // strict verify-pass
         public boolean strictVerifyEnabled = true;
         public double strictVerifyMinScore = 0.62;
 
-        // 3.6 LTM self-regulation
+        // LTM self-regulation
         public double ltmDecayPerTick = 0.0015;
         public double ltmPromotionBoost = 0.06;
 
@@ -277,7 +297,21 @@ public final class Think implements AutoCloseable {
         public int ltmRecallK = 64;
         public double ltmWriteMinGroundedness = 0.55;
 
-        // owned evaluation executor
+        // explore/exploit (used by engine as a “strictness knob” now)
+        public double exploitEvidenceStrictness = 0.78;
+
+        // Evaluator thresholds (NEW — чтобы не хардкодить в BaseCandidateEvaluator)
+        public double evalMinGroundedness = 0.45;
+        public double evalMaxContradictionRisk = 0.55;
+        public double evalMinQueryCoverage = 0.20;
+        public double evalMaxNovelty = 0.72;
+        public double evalMaxRepetition = 0.75;
+
+        public int evalMinChars = 16;
+        public int evalMaxCharsSoft = 1400;
+        public int evalMaxCharsHard = 2400;
+
+        // owned evaluation executor (kept for future use)
         public int evalParallelism = Math.max(1, Math.min(8, Runtime.getRuntime().availableProcessors()));
         public int evalQueueCapacity = 4096;
         public String evalThreadNamePrefix = "think-eval-";
@@ -294,12 +328,6 @@ public final class Think implements AutoCloseable {
             c.draftsPerIteration = 12;
             c.patience = 2;
             c.targetScore = 0.72;
-            c.refineRounds = 2;
-            c.refineQueryBudget = 24;
-
-            c.exploreIters = 2;
-            c.exploreRetrieveKMult = 1.7;
-            c.exploitEvidenceStrictness = 0.82;
 
             c.strictVerifyEnabled = true;
             c.strictVerifyMinScore = 0.66;
@@ -307,6 +335,15 @@ public final class Think implements AutoCloseable {
             c.ltmEnabled = true;
             c.ltmRecallK = 96;
             c.ltmWriteMinGroundedness = 0.60;
+
+            c.exploitEvidenceStrictness = 0.82;
+
+            // evaluator tighter
+            c.evalMinGroundedness = 0.50;
+            c.evalMaxContradictionRisk = 0.50;
+            c.evalMinQueryCoverage = 0.25;
+            c.evalMaxNovelty = 0.68;
+            c.evalMaxRepetition = 0.70;
 
             c.evalParallelism = Math.max(2, Math.min(12, Runtime.getRuntime().availableProcessors()));
             c.evalQueueCapacity = 8192;
@@ -320,6 +357,10 @@ public final class Think implements AutoCloseable {
             c.strictVerifyEnabled = true;
             c.strictVerifyMinScore = 0.58;
             c.exploitEvidenceStrictness = 0.74;
+
+            // evaluator looser for iteration speed
+            c.evalMinGroundedness = 0.40;
+            c.evalMaxContradictionRisk = 0.60;
             return c;
         }
 
@@ -331,11 +372,6 @@ public final class Think implements AutoCloseable {
             draftsPerIteration = Math.max(1, draftsPerIteration);
             patience = Math.max(0, patience);
 
-            refineRounds = Math.max(0, refineRounds);
-            refineQueryBudget = Math.max(1, refineQueryBudget);
-
-            exploreIters = Math.max(0, exploreIters);
-            if (exploreRetrieveKMult < 1.0) exploreRetrieveKMult = 1.0;
             exploitEvidenceStrictness = clamp01(exploitEvidenceStrictness);
 
             strictVerifyMinScore = Math.max(-10, Math.min(10, strictVerifyMinScore));
@@ -346,6 +382,16 @@ public final class Think implements AutoCloseable {
 
             if (ltmDecayPerTick < 0) ltmDecayPerTick = 0.0;
             if (ltmPromotionBoost < 0) ltmPromotionBoost = 0.0;
+
+            evalMinGroundedness = clamp01(evalMinGroundedness);
+            evalMaxContradictionRisk = clamp01(evalMaxContradictionRisk);
+            evalMinQueryCoverage = clamp01(evalMinQueryCoverage);
+            evalMaxNovelty = clamp01(evalMaxNovelty);
+            evalMaxRepetition = clamp01(evalMaxRepetition);
+
+            evalMinChars = Math.max(0, evalMinChars);
+            evalMaxCharsSoft = Math.max(64, evalMaxCharsSoft);
+            evalMaxCharsHard = Math.max(evalMaxCharsSoft, evalMaxCharsHard);
 
             evalParallelism = Math.max(1, evalParallelism);
             evalQueueCapacity = Math.max(32, evalQueueCapacity);
@@ -423,6 +469,7 @@ public final class Think implements AutoCloseable {
             b.kv("intentDetector", intentDetector.getClass().getName());
             b.kv("responseStrategy", responseStrategy.getClass().getName());
             b.kv("evaluator", evaluator.getClass().getName());
+            b.kv("overlapScorer", overlapScorer.getClass().getName());
             b.kv("generator", (generator == null) ? "<none>" : generator.getClass().getName());
             b.kv("engine", engine.getClass().getName());
             b.sep();
@@ -432,11 +479,7 @@ public final class Think implements AutoCloseable {
             b.kv("draftsPerIteration", config.draftsPerIteration);
             b.kv("patience", config.patience);
             b.kv("targetScore", config.targetScore);
-            b.kv("refineRounds", config.refineRounds);
-            b.kv("refineQueryBudget", config.refineQueryBudget);
             b.sep();
-            b.kv("exploreIters", config.exploreIters);
-            b.kv("exploreRetrieveKMult", config.exploreRetrieveKMult);
             b.kv("exploitEvidenceStrictness", config.exploitEvidenceStrictness);
             b.kv("strictVerifyEnabled", config.strictVerifyEnabled);
             b.kv("strictVerifyMinScore", config.strictVerifyMinScore);
@@ -452,6 +495,7 @@ public final class Think implements AutoCloseable {
             b.kv("evalQueueCapacity", config.evalQueueCapacity);
             b.kv("evalThreadNamePrefix", config.evalThreadNamePrefix);
             b.kv("evalPoolOwnership", ownsEvalPool ? "owned" : "external");
+            b.kv("evalPoolUsedByEngine", "false"); // current engine signature
         });
 
         System.out.println(msg);

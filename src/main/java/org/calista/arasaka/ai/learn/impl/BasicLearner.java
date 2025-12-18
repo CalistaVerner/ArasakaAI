@@ -10,10 +10,11 @@ import org.calista.arasaka.ai.tokenizer.Tokenizer;
 import java.nio.charset.StandardCharsets;
 import java.text.BreakIterator;
 import java.util.*;
+import java.util.regex.Pattern;
 import java.util.zip.CRC32;
 
-public final class AdvancedLearner implements Learner {
-    private static final Logger log = LogManager.getLogger(AdvancedLearner.class);
+public final class BasicLearner implements Learner {
+    private static final Logger log = LogManager.getLogger(BasicLearner.class);
 
     private final KnowledgeBase kb;
     private final Tokenizer tokenizer;
@@ -33,7 +34,13 @@ public final class AdvancedLearner implements Learner {
     private final int topKPerIteration;
     private final double minScoreToLearn;
 
-    public AdvancedLearner(
+    // --- formatting / boilerplate guards (generic, not domain-specific)
+    private static final Pattern MARKDOWN_HEADING = Pattern.compile("(?m)^\\s{0,3}#{1,6}\\s+.*$");
+    private static final Pattern LIST_LINE = Pattern.compile("(?m)^\\s{0,6}([\\-*•]|\\d+[\\.)])\\s+.*$");
+    private static final Pattern CODE_FENCE = Pattern.compile("(?s)```.*?```");
+    private static final Pattern HR_LINE = Pattern.compile("(?m)^\\s{0,3}(-{3,}|_{3,}|\\*{3,})\\s*$");
+
+    public BasicLearner(
             KnowledgeBase kb,
             Tokenizer tokenizer,
             double newWeight,
@@ -50,7 +57,7 @@ public final class AdvancedLearner implements Learner {
         );
     }
 
-    public AdvancedLearner(
+    public BasicLearner(
             KnowledgeBase kb,
             Tokenizer tokenizer,
             double newWeight,
@@ -101,8 +108,25 @@ public final class AdvancedLearner implements Learner {
         final String safeTag = normalizeTag(tag);
         final Map<String, String> ctx = (context == null) ? Map.of() : context;
 
-        final String normalized = normalizeText(text);
+        final boolean fromAssistant = isAssistantTag(safeTag) || "assistant".equalsIgnoreCase(ctx.get("source"));
+
+        // 0) Normalize + strip formatting/boilerplate BEFORE learning
+        String normalized = normalizeText(text);
+        normalized = stripFormatting(normalized);
+        normalized = normalizeText(normalized);
+
+        // If assistant output still looks like a structured template, skip entirely.
+        if (fromAssistant && looksLikeTemplate(normalized)) {
+            if (log.isDebugEnabled()) {
+                log.debug("AdvancedLearner: skipped template-like assistant text (len={})", normalized.length());
+            }
+            return List.of();
+        }
+
         if (normalized.isBlank()) return List.of();
+
+        // token count cache for this learn() call (big perf win)
+        final HashMap<String, Integer> tokCache = new HashMap<>(1024);
 
         // Многоитерационный цикл: каждый проход делает кандидатов чуть “чище” и точнее
         final ArrayList<Statement> learned = new ArrayList<>(64);
@@ -119,12 +143,12 @@ public final class AdvancedLearner implements Learner {
             // 1) Extract candidates from segments
             final ArrayList<Candidate> candidates = new ArrayList<>(256);
             for (String seg : segments) {
-                extractCandidates(seg, candidates);
+                extractCandidates(seg, candidates, tokCache, fromAssistant);
             }
 
             // 2) Score candidates (детерминированно)
             for (Candidate c : candidates) {
-                c.score = scoreCandidate(c.text, ctx);
+                c.score = scoreCandidate(c.text, ctx, tokCache);
             }
 
             // 3) Filter + TopK
@@ -154,7 +178,7 @@ public final class AdvancedLearner implements Learner {
             }
 
             // 5) Refine: следующая итерация учится уже на “лучших” кусках (и дробит длинные)
-            segments = refineSegmentsFromTop(selected);
+            segments = refineSegmentsFromTop(selected, tokCache);
 
             final long dtMs = (System.nanoTime() - t0) / 1_000_000L;
             if (log.isDebugEnabled()) {
@@ -171,7 +195,7 @@ public final class AdvancedLearner implements Learner {
 
     // ------------------------- core pipeline -------------------------
 
-    private void extractCandidates(String text, List<Candidate> out) {
+    private void extractCandidates(String text, List<Candidate> out, Map<String, Integer> tokCache, boolean fromAssistant) {
         // 1) sentence split (stable)
         BreakIterator it = BreakIterator.getSentenceInstance(Locale.ROOT);
         it.setText(text);
@@ -180,25 +204,29 @@ public final class AdvancedLearner implements Learner {
         for (int end = it.next(); end != BreakIterator.DONE; start = end, end = it.next()) {
             String s = text.substring(start, end).trim();
             s = cleanupSentence(s);
-            if (!passesQualityGateBasic(s)) continue;
+            if (fromAssistant) s = stripInlineFormatting(s);
+
+            if (!passesQualityGateBasic(s, tokCache, fromAssistant)) continue;
 
             // 2) если слишком длинно — дробим на клаузы (детерминированно)
-            List<String> parts = (tokenCount(s) > maxTokens) ? splitIntoClauses(s) : List.of(s);
+            List<String> parts = (tokenCount(s, tokCache) > maxTokens) ? splitIntoClauses(s) : List.of(s);
             for (String p : parts) {
                 String x = cleanupSentence(p);
-                if (!passesQualityGateBasic(x)) continue;
+                if (fromAssistant) x = stripInlineFormatting(x);
+
+                if (!passesQualityGateBasic(x, tokCache, fromAssistant)) continue;
                 String sig = crc32(x);
                 out.add(new Candidate(sig, x));
             }
         }
     }
 
-    private double scoreCandidate(String s, Map<String, String> ctx) {
+    private double scoreCandidate(String s, Map<String, String> ctx, Map<String, Integer> tokCache) {
         // Скорая “умность” без магии/рандома: чистые эвристики + токены.
         // Результат в [0..1], детерминированный.
 
         int len = s.length();
-        int tokens = tokenCount(s);
+        int tokens = tokenCount(s, tokCache);
 
         // База: “содержательность” по токенам
         double tokenScore = clamp01((tokens - minTokens) / 16.0); // после ~20 токенов почти насыщение
@@ -237,7 +265,7 @@ public final class AdvancedLearner implements Learner {
         String domain = safeLower(ctx.get("domain"));
         if (!domain.isBlank() && s.toLowerCase(Locale.ROOT).contains(domain)) ctxBonus += 0.05;
 
-        // Бонус за “структурность”: наличие глаголов/связок (очень мягко, без NLP зависимостей)
+        // Бонус за “структурность”: наличие связок (очень мягко, без NLP зависимостей)
         double structureBonus = 0.0;
         String low = s.toLowerCase(Locale.ROOT);
         if (low.contains(" is ") || low.contains(" are ") || low.contains(" это ") || low.contains(" является ")) {
@@ -287,7 +315,7 @@ public final class AdvancedLearner implements Learner {
         return st;
     }
 
-    private List<String> refineSegmentsFromTop(List<Candidate> selected) {
+    private List<String> refineSegmentsFromTop(List<Candidate> selected, Map<String, Integer> tokCache) {
         if (selected.isEmpty()) return List.of();
 
         // Берем лучшие и делаем “локальный контекст” для следующей итерации:
@@ -296,10 +324,10 @@ public final class AdvancedLearner implements Learner {
         ArrayList<String> segs = new ArrayList<>(Math.min(32, selected.size()));
         for (int i = 0; i < selected.size() && segs.size() < 24; i++) {
             String s = selected.get(i).text;
-            if (tokenCount(s) > maxTokens) {
+            if (tokenCount(s, tokCache) > maxTokens) {
                 for (String p : splitIntoClauses(s)) {
                     String x = cleanupSentence(p);
-                    if (passesQualityGateBasic(x)) segs.add(x);
+                    if (passesQualityGateBasic(x, tokCache, false)) segs.add(x);
                     if (segs.size() >= 24) break;
                 }
             } else {
@@ -311,10 +339,18 @@ public final class AdvancedLearner implements Learner {
 
     // ------------------------- gating / text utils -------------------------
 
-    private boolean passesQualityGateBasic(String s) {
+    private boolean passesQualityGateBasic(String s, Map<String, Integer> tokCache, boolean fromAssistant) {
         if (s == null || s.isBlank()) return false;
         if (s.length() < minChars) return false;
-        int tokens = tokenCount(s);
+
+        // For assistant text we avoid learning “section labels” and list fragments (format-driven).
+        if (fromAssistant) {
+            String t = s.trim();
+            if (t.startsWith("#")) return false;
+            if (t.startsWith("-") || t.startsWith("•") || t.matches("^\\d+[\\.)].*")) return false;
+        }
+
+        int tokens = tokenCount(s, tokCache);
         if (tokens < minTokens) return false;
 
         // мягкий анти-шум
@@ -331,8 +367,13 @@ public final class AdvancedLearner implements Learner {
         return true;
     }
 
-    private int tokenCount(String s) {
-        return tokenizer.tokenize(s).size();
+    private int tokenCount(String s, Map<String, Integer> cache) {
+        if (s == null || s.isBlank()) return 0;
+        Integer v = cache.get(s);
+        if (v != null) return v;
+        int n = tokenizer.tokenize(s).size();
+        cache.put(s, n);
+        return n;
     }
 
     private static List<String> splitIntoClauses(String s) {
@@ -431,6 +472,82 @@ public final class AdvancedLearner implements Learner {
         if (s == null) return "";
         if (s.length() <= max) return s;
         return s.substring(0, Math.max(0, max - 1)) + "…";
+    }
+
+    // ------------------------- assistant/template hygiene -------------------------
+
+    private static boolean isAssistantTag(String safeTag) {
+        // deterministic + flexible
+        return safeTag.contains("assistant") || "bot".equals(safeTag) || safeTag.endsWith(":assistant");
+    }
+
+    private static String stripFormatting(String s) {
+        if (s == null || s.isBlank()) return "";
+
+        // remove fenced code blocks
+        s = CODE_FENCE.matcher(s).replaceAll(" ");
+
+        // remove horizontal rules
+        s = HR_LINE.matcher(s).replaceAll(" ");
+
+        // remove markdown headings (whole lines)
+        s = MARKDOWN_HEADING.matcher(s).replaceAll(" ");
+
+        // remove list lines (whole lines) - they are usually scaffolding
+        s = LIST_LINE.matcher(s).replaceAll(" ");
+
+        // collapse excess whitespace
+        s = s.replaceAll("[\\t\\r\\n]+", " ");
+        s = s.replaceAll(" +", " ").trim();
+
+        return s;
+    }
+
+    private static String stripInlineFormatting(String s) {
+        if (s == null || s.isBlank()) return "";
+        // inline markdown emphasis/links are noise for memory
+        String x = s;
+        x = x.replaceAll("\\*\\*(.*?)\\*\\*", "$1");
+        x = x.replaceAll("\\*(.*?)\\*", "$1");
+        x = x.replaceAll("`([^`]+)`", "$1");
+        x = x.replaceAll("\\[([^\\]]+)]\\([^\\)]+\\)", "$1");
+        return x.trim();
+    }
+
+    private static boolean looksLikeTemplate(String s) {
+        if (s == null) return false;
+        String t = s.trim();
+        if (t.isEmpty()) return false;
+
+        // Generic template signals: many section markers, many bullets, very low sentence diversity.
+        int headings = countMatches(t, "##");
+        int bullets = countMatches(t, "\n-") + countMatches(t, "\n•") + countMatches(t, "\n1.");
+        if (headings >= 2) return true;
+        if (bullets >= 4) return true;
+
+        // If text is dominated by very short segments after stripping, it's likely scaffolding.
+        String[] parts = t.split("[.!?]+");
+        int shortOnes = 0;
+        int total = 0;
+        for (String p : parts) {
+            String x = p.trim();
+            if (x.isEmpty()) continue;
+            total++;
+            if (x.length() < 18) shortOnes++;
+        }
+        return total >= 3 && shortOnes >= (int) Math.ceil(total * 0.7);
+    }
+
+    private static int countMatches(String s, String sub) {
+        int c = 0;
+        int i = 0;
+        while (true) {
+            int p = s.indexOf(sub, i);
+            if (p < 0) break;
+            c++;
+            i = p + sub.length();
+        }
+        return c;
     }
 
     // ------------------------- internal data -------------------------

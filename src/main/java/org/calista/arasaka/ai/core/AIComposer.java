@@ -7,15 +7,18 @@ import org.calista.arasaka.ai.retrieve.retriver.Retriever;
 import org.calista.arasaka.ai.retrieve.retriver.impl.KnowledgeRetriever;
 import org.calista.arasaka.ai.retrieve.scorer.Scorer;
 import org.calista.arasaka.ai.retrieve.scorer.impl.TokenOverlapScorer;
-import org.calista.arasaka.ai.think.response.ContextAnswerStrategy;
-import org.calista.arasaka.ai.think.response.ResponseStrategy;
 import org.calista.arasaka.ai.think.Think;
 import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
+import org.calista.arasaka.ai.think.candidate.impl.BaseCandidateEvaluator;
 import org.calista.arasaka.ai.think.candidate.impl.MultiCriteriaCandidateEvaluator;
+import org.calista.arasaka.ai.think.response.ContextAnswerStrategy;
+import org.calista.arasaka.ai.think.response.ResponseStrategy;
 import org.calista.arasaka.ai.think.textGenerator.TextGenerator;
 import org.calista.arasaka.ai.think.textGenerator.impl.BigramBeamTextGenerator;
 import org.calista.arasaka.ai.tokenizer.Tokenizer;
-import org.graalvm.polyglot.*;
+import org.graalvm.polyglot.Context;
+import org.graalvm.polyglot.Source;
+import org.graalvm.polyglot.Value;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,8 +40,11 @@ public final class AIComposer {
      */
     private volatile Think lastThink;
 
+    /** Enterprise: re-prepare overlap scorer only when KB size changes. */
+    private volatile int lastKbSize = -1;
+
     public AIComposer(AIApp app) {
-        this.app = app;
+        this.app = Objects.requireNonNull(app, "app");
         this.context = app.getKernel().jsContext();
         try {
             context.eval(Source.newBuilder("js", new File("script/ai_composer.js")).build());
@@ -52,16 +58,33 @@ public final class AIComposer {
     }
 
     /**
-     * Backward-compatible method: returns ThoughtCycleEngine (engine),
-     * but internally constructs Think orchestrator (owns eval pool).
+     * Backward-compatible method: returns Think orchestrator (owns eval pool).
      */
     public Think buildEngine(AIKernel kernel, Tokenizer tokenizer) {
         Objects.requireNonNull(kernel, "kernel");
         Objects.requireNonNull(tokenizer, "tokenizer");
+
         AIConfig cfg = kernel.config();
 
         // ---------- common deps (Java only) ----------
-        Scorer scorer = new TokenOverlapScorer(tokenizer);
+        TokenOverlapScorer overlapScorer = new TokenOverlapScorer(tokenizer);
+
+        // Enterprise warmup: stable snapshot corpus (ordered by id)
+        // + cheap re-prepare gate by size() to keep IDF/avgDocLen fresh without "magic".
+        try {
+            int kbSize = kernel.knowledge().size();
+            if (kbSize != lastKbSize) {
+                lastKbSize = kbSize;
+                var corpus = kernel.knowledge().snapshotSorted();
+                if (corpus != null && !corpus.isEmpty()) {
+                    overlapScorer.prepare(corpus);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("TokenOverlapScorer.prepare(snapshotSorted) failed; continuing without IDF warmup", e);
+        }
+
+        Scorer scorer = overlapScorer;
 
         ExplorationConfig expl = ExplorationConfig.builder()
                 .temperature(cfg.thinking.exploration.temperature)
@@ -103,8 +126,23 @@ public final class AIComposer {
                 12
         );
 
-        //IntentDetector intentDetector = new IntentDetector();
-        CandidateEvaluator evaluator = new MultiCriteriaCandidateEvaluator(tokenizer);
+        // ---- Evaluator stack (Base -> MultiCriteria) ----
+        // Keep these defaults stable; override via state.tags when needed.
+        BaseCandidateEvaluator baseEval = new BaseCandidateEvaluator(
+                tokenizer,
+                overlapScorer,
+                0.55, // minGroundedness
+                0.55, // maxContradictionRisk
+                0.28, // minQueryCoverage
+                0.70, // maxNovelty
+                0.75, // maxRepetition
+                12,   // minChars
+                1200, // maxCharsSoft
+                2400  // maxCharsHard
+        );
+
+        CandidateEvaluator evaluator = new MultiCriteriaCandidateEvaluator(baseEval);
+
         ResponseStrategy strategy = new ContextAnswerStrategy();
         TextGenerator generator = new BigramBeamTextGenerator(tokenizer);
 
@@ -124,9 +162,6 @@ public final class AIComposer {
         thinkCfg.ltmRecallK = i(plan, "ltmRecallK");
         thinkCfg.ltmWriteMinGroundedness = d(plan, "ltmWriteMinGroundedness");
 
-        thinkCfg.refineRounds = i(plan, "refineRounds");
-        thinkCfg.refineQueryBudget = i(plan, "refineQueryBudget");
-
         // ✅ evalPool: nested
         Object ep = plan.get("evalPool");
         if (ep instanceof Map<?, ?> m) {
@@ -135,18 +170,18 @@ public final class AIComposer {
 
             if (eval.containsKey("parallelism")) thinkCfg.evalParallelism = i(eval, "parallelism");
             if (eval.containsKey("queueCapacity")) thinkCfg.evalQueueCapacity = i(eval, "queueCapacity");
-            if (eval.containsKey("threadNamePrefix"))
+            if (eval.containsKey("threadNamePrefix")) {
                 thinkCfg.evalThreadNamePrefix = s(eval, "threadNamePrefix", thinkCfg.evalThreadNamePrefix);
-            if (eval.containsKey("shutdownTimeoutMs"))
+            }
+            if (eval.containsKey("shutdownTimeoutMs")) {
                 thinkCfg.evalShutdownTimeoutMs = l(eval, "shutdownTimeoutMs");
+            }
         }
-
 
         // Build Think orchestrator
         log.info("Building Think Orchestrator");
         Think think = Think.builder(retriever, tokenizer)
                 .config(thinkCfg)
-                //.intentDetector(intentDetector)
                 .evaluator(evaluator)
                 .responseStrategy(strategy)
                 .generator(generator)

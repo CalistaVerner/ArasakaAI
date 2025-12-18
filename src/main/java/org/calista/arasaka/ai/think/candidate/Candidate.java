@@ -13,7 +13,7 @@ public final class Candidate {
     public final String query;
 
     /** Draft text (never null). */
-    public final String text;
+    public String text;
 
     // engine meta
     public int iteration;

@@ -4,18 +4,21 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.calista.arasaka.ai.knowledge.Statement;
 import org.calista.arasaka.ai.think.ThoughtState;
+import org.calista.arasaka.ai.think.utils.Tags;
+import org.calista.arasaka.ai.think.candidate.CandidateControlSignals;
 import org.calista.arasaka.ai.think.candidate.CandidateEvaluator;
 
 import java.util.*;
 
 /**
- * MultiCriteriaCandidateEvaluator (Quantum-like):
- * - multi-channel scoring on top of BaseCandidateEvaluator
+ * MultiCriteriaCandidateEvaluator:
+ * - multi-channel scoring layered on top of BaseCandidateEvaluator
  * - coherence & entropy penalties
  * - deterministic (no randomness)
  *
  * Strict verify-pass mode:
- * - can be enabled by setting state.tags (engine-driven), or by calling evaluateStrict(...)
+ * - enabled by state.tags (engine-driven) using Tags.VERIFY_STRICT / Tags.REPAIR_STRICT,
+ *   or by calling evaluateStrict(...).
  *
  * NOTE:
  * - Must conform to CandidateEvaluator.evaluate(userText, context, state, draft)
@@ -28,33 +31,27 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
     private final BaseCandidateEvaluator base;
 
     // --- quantum policy knobs ---
-    private final double minCoherence;        // 0..1
-    private final double entropyPenaltyWeight;
-    private final double coherenceWeight;
+    private final double minCoherence;           // 0..1
+    private final double entropyPenaltyWeight;   // 0..1
+    private final double coherenceWeight;        // 0..1
 
     // --- strict verify knobs ---
-    private final double strictMinCoherenceBoost;     // +0.12
-    private final double strictEntropyBoost;          // +0.10
-    private final double strictRiskWeight;            // 0.45 (vs 0.30)
-    private final double baseRiskWeight;              // default risk weight in non-strict
+    private final double strictMinCoherenceBoost; // +0.12
+    private final double strictEntropyBoost;      // +0.10
+    private final double strictRiskWeight;        // 0..1
+    private final double baseRiskWeight;          // 0..1
 
     // --- debug knobs ---
     private final boolean debugEnabled;
     private final int debugSnippetChars;
 
-    public MultiCriteriaCandidateEvaluator(org.calista.arasaka.ai.tokenizer.Tokenizer tokenizer) {
-        this(
-                new BaseCandidateEvaluator(tokenizer),
-                0.45,
-                0.35,
-                0.40,
-                0.12,
-                0.10,
-                0.45,
-                0.30,
-                false,
-                180
-        );
+    /**
+     * IMPORTANT:
+     * In current project BaseCandidateEvaluator does NOT have a (Tokenizer-only) ctor.
+     * Provide a fully constructed BaseCandidateEvaluator to avoid hidden hardcode.
+     */
+    public MultiCriteriaCandidateEvaluator(BaseCandidateEvaluator base) {
+        this(base, 0.45, 0.35, 0.40, 0.12, 0.10, 0.45, 0.30, false, 180);
     }
 
     public MultiCriteriaCandidateEvaluator(
@@ -105,52 +102,54 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
 
     @Override
     public Evaluation evaluate(String userText, List<Statement> context, ThoughtState state, String draft) {
-        // Strict mode can be injected by engine via tags, but to avoid coupling
-        // we use a conservative rule: strict if state != null and state.phase suggests repair/verify.
         boolean strict = isStrict(state);
         return evaluateInternal(userText, context, state, draft, strict);
     }
 
-    /**
-     * Optional strict verify-pass entrypoint (engine may call explicitly).
-     * Does NOT change interface; just a convenience method.
-     */
+    /** Optional strict verify-pass entrypoint (engine may call explicitly). */
     public Evaluation evaluateStrict(String userText, List<Statement> context, ThoughtState state, String draft) {
         return evaluateInternal(userText, context, state, draft, true);
     }
 
     private Evaluation evaluateInternal(String userText, List<Statement> context, ThoughtState state, String draft, boolean strict) {
-        final long t0 = System.nanoTime();
-
-        final String q = userText == null ? "" : userText.trim();
-        final String a = draft == null ? "" : draft.trim();
+        final String q = (userText == null) ? "" : userText.trim();
+        final String a = (draft == null) ? "" : draft.trim();
         final int ctxSize = (context == null) ? 0 : context.size();
 
-        // ---- Base (classical) evaluation ----
-        Evaluation e = base.evaluate(q, context, state, a);
-        if (e == null) {
-            Evaluation z = new Evaluation();
-            z.score = -1.0;
+        // ---- Base evaluation ----
+        Evaluation baseEv;
+        try {
+            baseEv = base.evaluate(q, context, state, a);
+        } catch (Exception ex) {
+            log.warn("MultiCriteriaCandidateEvaluator: base.evaluate failed", ex);
+            Evaluation z = Evaluation.invalid(Double.NEGATIVE_INFINITY, "err=base_eval_exception", "");
             z.valid = false;
-            z.critique = "err=null_eval";
-            z.validationNotes = "err=null_eval";
             z.syncNotes();
             return z;
         }
 
-        // ---- Quantum channels (superposition) ----
-        double factual = clamp01(e.groundedness);
-        double structure = clamp01(e.structureScore);
+        if (baseEv == null) {
+            Evaluation z = Evaluation.invalid(Double.NEGATIVE_INFINITY, "err=null_eval", "");
+            z.valid = false;
+            z.syncNotes();
+            return z;
+        }
+        baseEv.syncNotes();
 
-        // coverage: cheap lexical overlap proxy (deterministic)
-        double coverage = clamp01(coverageProxy(q, a));
+        // ---- Channels ----
+        double factual = clamp01(baseEv.groundedness);
+        double structure = clamp01(baseEv.structureScore);
 
-        // actionability: proxies + structure (deterministic)
+        // Prefer evaluator’s own qc if present (we added queryCoverage to Evaluation),
+        // fall back to proxy if old evaluator didn't fill it.
+        double coverage = (baseEv.queryCoverage > 0.0) ? clamp01(baseEv.queryCoverage) : clamp01(coverageProxy(q, a));
+
+        // Actionability: proxy + structure
         double actionability = clamp01(actionabilityProxy(a, structure));
 
-        double risk = clamp01(e.contradictionRisk);
+        double risk = clamp01(baseEv.contradictionRisk);
 
-        double[] channels = { factual, structure, coverage, actionability };
+        double[] channels = {factual, structure, coverage, actionability};
 
         // ---- Entropy & coherence ----
         double entropy = entropy(channels);
@@ -162,33 +161,49 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
         double riskW = strict ? this.strictRiskWeight : this.baseRiskWeight;
 
         // ---- Quantum-adjusted score ----
+        // IMPORTANT:
+        // - baseEv.score is already clamped to [0..1] in BaseCandidateEvaluator
+        // - here we keep it stable but re-clamp final score into [0..1] for engine thresholds.
         double quantumScore =
-                e.score
+                baseEv.score
                         + coherenceWeight * coherence
                         - entW * entropy
                         - riskW * risk;
 
-        boolean valid = e.valid && coherence >= minCoh;
+        quantumScore = clamp01(quantumScore);
+
+        boolean valid = baseEv.valid && coherence >= minCoh;
 
         // ---- Output: keep base metrics, add quantum telemetry ----
         Evaluation out = new Evaluation();
         out.score = quantumScore;
         out.valid = valid;
 
-        out.groundedness = e.groundedness;
-        out.contradictionRisk = e.contradictionRisk;
-        out.structureScore = e.structureScore;
+        out.groundedness = baseEv.groundedness;
+        out.contradictionRisk = baseEv.contradictionRisk;
+        out.structureScore = baseEv.structureScore;
 
-        // keep base aux metrics if base computed them
+        out.queryCoverage = coverage;
         out.coherence = coherence;
-        out.repetition = e.repetition;
-        out.novelty = e.novelty;
+        out.repetition = baseEv.repetition;
+        out.novelty = baseEv.novelty;
 
-        String telemetry =
-                safe(e.validationNotes)
+        // Keep generator-safe critique: only actionable short hint.
+        if (!valid) {
+            StringBuilder c = new StringBuilder(96);
+            if (!baseEv.valid) c.append("base_fail ");
+            if (coherence < minCoh) c.append("low_coherence ");
+            if (risk > 0.60) c.append("high_risk ");
+            out.critique = c.toString().trim();
+        } else {
+            out.critique = ""; // don't spam generator
+        }
+
+        out.validationNotes =
+                safe(baseEv.validationNotes)
                         + ";q_f=" + fmt2(factual)
                         + ";q_s=" + fmt2(structure)
-                        + ";q_cov=" + fmt2(coverage)
+                        + ";q_qc=" + fmt2(coverage)
                         + ";q_act=" + fmt2(actionability)
                         + ";q_r=" + fmt2(risk)
                         + ";q_ent=" + fmt2(entropy)
@@ -199,31 +214,23 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
                         + ";q_strict=" + (strict ? 1 : 0)
                         + ";q_v=" + (valid ? 1 : 0);
 
-        // critique: keep it short & generator-safe
-        out.critique = "quantum"
-                + ";coh=" + fmt2(coherence)
-                + ";ent=" + fmt2(entropy)
-                + ";risk=" + fmt2(risk)
-                + ";v=" + (valid ? 1 : 0);
-
-        out.validationNotes = telemetry;
         out.syncNotes();
 
         if (log.isDebugEnabled()) {
-            boolean flip = (e.valid != valid);
+            boolean flip = (baseEv.valid != valid);
             boolean lowC = coherence < minCoh;
 
             if (debugEnabled || flip || lowC || strict) {
                 log.debug(
                         "QuantumEval | strict={} ctx={} baseScore={} qScore={} valid={} (baseValid={}) " +
-                                "| g={} st={} cov={} act={} risk={} coh={} ent={} " +
+                                "| g={} st={} qc={} act={} risk={} coh={} ent={} " +
                                 "| q='{}' a='{}'",
                         strict ? 1 : 0,
                         ctxSize,
-                        fmt4(e.score),
+                        fmt4(baseEv.score),
                         fmt4(quantumScore),
                         valid,
-                        e.valid,
+                        baseEv.valid,
                         fmt3(factual),
                         fmt3(structure),
                         fmt3(coverage),
@@ -238,7 +245,7 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
         }
 
         if (debugEnabled && log.isDebugEnabled()) {
-            log.debug("QuantumEvalTelemetry | {}", telemetry);
+            log.debug("QuantumEvalTelemetry | {}", out.validationNotes);
         }
 
         return out;
@@ -249,17 +256,21 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
     private static boolean isStrict(ThoughtState state) {
         if (state == null) return false;
 
-        // If engine uses phase ordinals, "repair/verify" typically has higher values.
-        // Keep it conservative: strict only when phase is non-zero AND tags indicate repair intent.
-        if (state.tags != null) {
-            String v = state.tags.get("verify.strict");
-            if ("1".equals(v) || "true".equalsIgnoreCase(v) || "yes".equalsIgnoreCase(v)) return true;
-            v = state.tags.get("repair.strict");
-            if ("1".equals(v) || "true".equalsIgnoreCase(v)) return true;
+        Map<String, String> tags = state.tags;
+        if (tags != null && !tags.isEmpty()) {
+            if (isTrue(tags.get(Tags.VERIFY_STRICT))) return true;
+            if (isTrue(tags.get(Tags.REPAIR_STRICT))) return true;
         }
 
-        // fallback heuristic: later iterations are more likely verify-pass
-        return state.iteration >= 2 && state.phase != 0;
+        // fallback heuristic: verify/repair often happens later
+        // (keep conservative to avoid surprising score shifts early)
+        return state.iteration >= 2 && state.phase == CandidateControlSignals.Phase.REPAIR.ordinal();
+    }
+
+    private static boolean isTrue(String v) {
+        if (v == null) return false;
+        String x = v.trim();
+        return "1".equals(x) || "true".equalsIgnoreCase(x) || "yes".equalsIgnoreCase(x);
     }
 
     // -------------------- proxies (deterministic, no tokenizer coupling) --------------------
@@ -267,7 +278,6 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
     private static double coverageProxy(String q, String a) {
         if (q == null || q.isBlank() || a == null || a.isBlank()) return 0.0;
 
-        // cheap char-level overlap proxy: intersection of lowercased "wordish" tokens length>=3
         Set<String> qs = cheapTokenSet(q);
         if (qs.isEmpty()) return 0.0;
 
@@ -286,7 +296,6 @@ public final class MultiCriteriaCandidateEvaluator implements CandidateEvaluator
         int bullets = countBulletLikeLines(a);
         double bulletScore = clamp01(bullets / 8.0);
 
-        // slight bias to structured output
         return clamp01(0.55 * bulletScore + 0.45 * clamp01(structureScore));
     }
 
